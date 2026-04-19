@@ -1279,6 +1279,76 @@ def _make_keybindings(repl_mode_container):
     return kb
 
 
+# ── @ directive expansion ─────────────────────────────────────────────────────
+
+_IGNORE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache", ".pytest_cache", "dist", "build", ".tox"}
+
+
+def _generate_tree(root: str, max_depth: int = 4) -> str:
+    """Return a pretty tree string for *root* up to *max_depth* levels."""
+    lines = [os.path.basename(root) or root]
+
+    def _walk(path: str, prefix: str, depth: int):
+        if depth > max_depth:
+            return
+        try:
+            entries = sorted(os.listdir(path))
+        except PermissionError:
+            return
+        entries = [e for e in entries if not (e.startswith(".") and e not in ()) or e == ".env"]
+        # Filter ignored dirs
+        visible = [e for e in entries if not (os.path.isdir(os.path.join(path, e)) and e in _IGNORE_DIRS)]
+        for i, name in enumerate(visible):
+            connector = "└── " if i == len(visible) - 1 else "├── "
+            lines.append(f"{prefix}{connector}{name}")
+            full = os.path.join(path, name)
+            if os.path.isdir(full):
+                extension = "    " if i == len(visible) - 1 else "│   "
+                _walk(full, prefix + extension, depth + 1)
+
+    _walk(root, "", 1)
+    return "\n".join(lines)
+
+
+def _expand_at_directives(prompt: str, work_dir: str) -> str:
+    """Replace @-directives in *prompt* with their expanded content."""
+    import re
+
+    # @tree → directory tree of work_dir
+    if "@tree" in prompt:
+        tree = _generate_tree(work_dir)
+        block = f"<tree>\n{tree}\n</tree>"
+        prompt = prompt.replace("@tree", block)
+
+    # @file:<path> → file contents
+    def _expand_file(m: re.Match) -> str:
+        fpath = m.group(1)
+        full = fpath if os.path.isabs(fpath) else os.path.join(work_dir, fpath)
+        try:
+            content = Path(full).read_text(errors="replace")
+            return f"<file path=\"{fpath}\">\n{content}\n</file>"
+        except FileNotFoundError:
+            return f"[file not found: {fpath}]"
+
+    prompt = re.sub(r"@file:(\S+)", _expand_file, prompt)
+
+    # @git → recent git log + diff stat
+    if "@git" in prompt:
+        try:
+            log = subprocess.check_output(
+                ["git", "-C", work_dir, "log", "--oneline", "-10"], text=True, stderr=subprocess.DEVNULL
+            )
+            diff = subprocess.check_output(
+                ["git", "-C", work_dir, "diff", "--stat", "HEAD"], text=True, stderr=subprocess.DEVNULL
+            )
+            block = f"<git>\n## Recent commits\n{log}\n## Diff stat\n{diff}\n</git>"
+        except Exception:
+            block = "[git info unavailable]"
+        prompt = prompt.replace("@git", block)
+
+    return prompt
+
+
 # ── REPL ──────────────────────────────────────────────────────────────────────
 
 
@@ -1590,19 +1660,22 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
                 print(f"{RED}unknown: {cmd}{RESET}  (try /help)")
             continue
 
+        # ── @ directive expansion ──────────────────────────────────────────
+        expanded_input = _expand_at_directives(user_input, _work_dir)
+
         # ── chat turn ─────────────────────────────────────────────────────
         print()
         if current_agent == "claude":
             _process_turn_claude(
                 claude_agent,
                 chat,
-                user_input,
+                expanded_input,
                 plan_mode=repl_mode_container[0] == "plan",
             )
         elif current_agent == "opencode":
-            _process_turn_opencode(oc_agent, chat, user_input)
+            _process_turn_opencode(oc_agent, chat, expanded_input)
         elif current_agent == "copilot":
-            _process_turn_copilot(copilot_agent, chat, user_input)
+            _process_turn_copilot(copilot_agent, chat, expanded_input)
         else:
             if repl_mode_container[0] == "plan":
                 filtered_tools = [
@@ -1613,12 +1686,12 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
                 )
                 base_sys = _build_system_prompt(filtered_tools)
                 chat._messages[0]["content"] = PLANNER_SYSTEM_PROMPT + "\n\n" + base_sys
-                chat.add(user_input)
+                chat.add(expanded_input)
                 turn_thinking = _process_turn(agent_filtered, chat, current_mode)
                 if turn_thinking:
                     last_thinking = turn_thinking
             else:
-                chat.add(user_input)
+                chat.add(expanded_input)
                 turn_thinking = _process_turn(agent, chat, current_mode)
                 if turn_thinking:
                     last_thinking = turn_thinking
