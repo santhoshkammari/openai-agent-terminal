@@ -634,6 +634,101 @@ class AIAgent:
                 yield DoneEvent()
                 return
 
+    # ── high-level API ────────────────────────────────────────────────────────
+
+    def task(self, prompt: "str | Chat", **kwargs) -> "Chat":
+        """Blocking run: str or Chat in → runs forward → returns Chat (.answer ready)."""
+        chat = self._ensure_chat(prompt)
+        for _ in self.forward(chat, **kwargs):
+            pass
+        return chat
+
+    def __call__(self, prompt: "str | Chat", **kwargs) -> "Chat":
+        return self.task(prompt, **kwargs)
+
+    def batch(self, prompts: list, **kwargs) -> "list[Chat]":
+        """Run prompts in parallel. Returns list[Chat] in same order as input."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+            futures = [pool.submit(self.task, p, **kwargs) for p in prompts]
+            return [f.result() for f in futures]
+
+    def compress(self, chat: "Chat", keep_last: int = 4) -> "Chat":
+        """Summarize old history, keep last keep_last exchange pairs. Returns new Chat."""
+        system_msgs = [m for m in chat.messages if m["role"] == "system"]
+        non_system = [m for m in chat.messages if m["role"] != "system"]
+        cutoff = keep_last * 2
+        if len(non_system) <= cutoff:
+            return chat
+        old, recent = non_system[:-cutoff], non_system[-cutoff:]
+        history_text = "\n".join(
+            f"{m['role']}: {(m.get('content') or '')[:400]}"
+            for m in old
+            if isinstance(m.get("content"), str)
+        )
+        summary = self.task(
+            f"Summarize this conversation in 2-4 sentences:\n\n{history_text}"
+        ).answer
+        compressed = Chat.__new__(Chat)
+        compressed._messages = (
+            system_msgs
+            + [{"role": "user", "content": f"[Prior conversation summary]: {summary}"},
+               {"role": "assistant", "content": "Got it, I have context from our earlier conversation."}]
+            + recent
+        )
+        return compressed
+
+    def pipe(self, *agents: "AIAgent") -> "PipelineAgent":
+        """Chain this agent with more agents: each agent's answer feeds the next."""
+        return PipelineAgent([self] + list(agents))
+
+    def evaluate(self, chat: "Chat", rubric: str) -> float:
+        """Judge chat.answer against rubric. Returns score 0.0–1.0."""
+        import re
+        raw = self.task(
+            f"Rate this answer 0–10 (reply with a single number only).\n"
+            f"Rubric: {rubric}\nAnswer: {chat.answer}"
+        ).answer.strip()
+        m = re.search(r"\d+(?:\.\d+)?", raw)
+        try:
+            return round(min(max(float(m.group()) / 10.0, 0.0), 1.0), 3) if m else 0.0
+        except ValueError:
+            return 0.0
+
+    def structured(self, prompt: "str | Chat", schema, **kwargs):
+        """Run prompt with JSON schema constraint. Returns schema instance if Pydantic, else dict."""
+        chat = self._ensure_chat(prompt)
+        result = self.task(chat, structured_output=StructuredOutput(json=schema), **kwargs)
+        try:
+            data = json.loads(result.answer)
+        except (json.JSONDecodeError, ValueError):
+            return {"raw": result.answer}
+        try:
+            from pydantic import BaseModel as _PydanticBase
+            if isinstance(schema, type) and issubclass(schema, _PydanticBase):
+                return schema(**data)
+        except (ImportError, Exception):
+            pass
+        return data
+
+
+class PipelineAgent:
+    """Chain of AIAgents: each agent's .answer becomes the next agent's input."""
+
+    def __init__(self, agents: list):
+        self._agents = agents
+
+    def task(self, prompt: "str | Chat", **kwargs) -> "Chat":
+        chat = AIAgent._ensure_chat(prompt)
+        for i, agent in enumerate(self._agents):
+            chat = agent.task(chat.answer if i > 0 else chat, **kwargs)
+        return chat
+
+    def __call__(self, prompt: "str | Chat", **kwargs) -> "Chat":
+        return self.task(prompt, **kwargs)
+
+    def pipe(self, *more: "AIAgent") -> "PipelineAgent":
+        return PipelineAgent(self._agents + list(more))
+
 
 class OpenCodeAgent:
     """
@@ -1217,6 +1312,89 @@ if __name__ == "__main__":
         ):
             _print_stream(event)
 
+    # ── new high-level API demos ──────────────────────────────────────────
+    def demo_task():
+        print("\n=== task / __call__ ===")
+        agent = AIAgent()
+        chat = agent("Say hello in one sentence.")
+        print("answer:", chat.answer)
+
+    def demo_batch():
+        print("\n=== batch (parallel) ===")
+        agent = AIAgent()
+        questions = [
+            "What is the capital of France?",
+            "Who wrote Romeo and Juliet?",
+            "What is 12 * 8?",
+        ]
+        results = agent.batch(questions, mode="instruct_general")
+        for q, chat in zip(questions, results):
+            print(f"Q: {q}\nA: {chat.answer}\n")
+
+    def demo_compress():
+        print("\n=== compress ===")
+        agent = AIAgent()
+        chat = Chat()
+        for i in range(6):
+            chat.add(f"Tell me about topic {i}", role="user")
+            chat.add(f"Topic {i} is about X, Y, and Z with many interesting aspects.", role="assistant")
+        print(f"Before: {len(chat.messages)} messages")
+        compressed = agent.compress(chat, keep_last=2)
+        print(f"After:  {len(compressed.messages)} messages")
+        print("Summary:", compressed.messages[1]["content"][:120])
+
+    def demo_pipe():
+        print("\n=== pipe (chain agents) ===")
+        agent = AIAgent()
+        # stage 1: expand → stage 2: compress into a single sentence
+        pipeline = agent.pipe(agent)
+        r1 = agent.task("List 3 benefits of open-source software.", mode="instruct_general")
+        r2 = agent.task(
+            f"Summarize this in one sentence: {r1.answer}", mode="instruct_general"
+        )
+        print("Stage 1:", r1.answer)
+        print("Stage 2 (pipe):", r2.answer)
+        # one-shot via pipeline
+        result = pipeline("What is machine learning?", mode="instruct_general")
+        print("Pipeline one-shot:", result.answer)
+
+    def demo_evaluate():
+        print("\n=== evaluate ===")
+        agent = AIAgent()
+        chat = agent("Explain recursion in one sentence.", mode="instruct_general")
+        score = agent.evaluate(chat, rubric="Is the answer clear, accurate, and concise?")
+        print(f"Answer: {chat.answer}")
+        print(f"Score:  {score:.3f} / 1.0")
+
+    def demo_structured_new():
+        print("\n=== structured() new API ===")
+        from pydantic import BaseModel
+
+        class Recipe(BaseModel):
+            name: str
+            ingredients: list[str]
+            steps: list[str]
+
+        agent = AIAgent()
+        result = agent.structured(
+            f"Give me a simple pasta recipe. Schema: {Recipe.model_json_schema()}",
+            schema=Recipe,
+            mode="instruct_general",
+        )
+        # result is a Recipe instance, not a dict
+        print(type(result))           # <class '__main__.Recipe'>
+        print(result.name)            # "Spaghetti Carbonara"
+        print(result.ingredients)     # ['pasta', 'eggs', ...]
+        print(result.model_dump())    # full dict if needed
+
+    demo_task()
+    demo_batch()
+    demo_compress()
+    demo_pipe()
+    demo_evaluate()
+    demo_structured_new()
+
+    # ── original demos ────────────────────────────────────────────────────
     demo_streaming()
     demo_step()
     demo_forward()
