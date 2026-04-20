@@ -557,12 +557,16 @@ class AIAgent:
                     return
             step += 1
 
+            _call_kwargs = dict(kwargs)
+            _effective_schemas = _tool_schemas or None
+            if not _effective_schemas:
+                _call_kwargs.pop("tool_choice", None)
             stream = self.client.chat.completions.create(
                 messages=chat.messages, model=model, max_tokens=max_tokens,
                 stream=True,
-                tools=_tool_schemas or None,
+                tools=_effective_schemas,
                 **resolve_args,
-                **kwargs
+                **_call_kwargs
             )
 
             tool_calls: list[ToolCall] = []

@@ -292,18 +292,19 @@ def kivi(prompt: str) -> str:
     """Launch a kivi sub-agent with the given prompt and return its full output.
     Use this to delegate tasks to a parallel AI agent that can use all the same tools."""
     try:
-        r = subprocess.run(
-            ["kivi", "-p", prompt],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            cwd=_work_dir,
-            env=_env(),
-        )
-        out = (r.stdout + r.stderr).strip()
-        return out[:16000] if out else "[no output]"
-    except subprocess.TimeoutExpired:
-        return "[kivi error] timed out (300s)"
+        base_url = os.environ.get("OPENAI_BASE_URL", "http://192.168.170.76:8000/v1")
+        from ai_sync import AIAgent, AIConfig, Chat, Text, ToolCall, ToolResult, AgentResult, StepResult
+        sub_chat = Chat()
+        sub_tools = [read, write, edit, bash, glob, grep, web_search, web_fetch]
+        sub_chat._messages.append({"role": "system", "content": _build_system_prompt(sub_tools)})
+        sub_chat.add(prompt)
+        agent = AIAgent(config=AIConfig(base_url=base_url), tools=sub_tools)
+        parts = []
+        for event in agent.forward(sub_chat, mode="instruct_coding", tool_choice="auto"):
+            if isinstance(event, Text) and event.id is None:
+                parts.append(event.content)
+        result = "".join(parts).strip()
+        return result[:16000] if result else "[no output]"
     except Exception as e:
         return f"[kivi error] {e}"
 
@@ -317,59 +318,18 @@ class ClaudeTool:
         prompt: The task or question to send to Claude.
         use_full_chat_history: If true, prepend the full conversation as context.
         pass_parent_prompt: If true, append the last user message as context.
+
+    Session strategy: always fresh — sub-agent calls are independent tasks,
+    resuming an unrelated previous session pollutes context and wastes tokens.
+    Cache benefit happens naturally when kivi calls claude multiple times within
+    the same turn (< 5 min apart), without us forcing session reuse.
     """
 
     __name__ = "claude"
     _MODEL = "claude-sonnet-4-6"
-    _MAX_TURNS = 5
-    _DB = Path.home() / ".ai_cli" / "claude_tool_sessions.db"
 
     def __init__(self, chat: "Chat"):
         self._chat = chat
-        self._DB.parent.mkdir(parents=True, exist_ok=True)
-        import sqlite3
-
-        with sqlite3.connect(self._DB) as con:
-            con.execute("""CREATE TABLE IF NOT EXISTS sessions (
-                cwd TEXT PRIMARY KEY, session_id TEXT, turns INTEGER DEFAULT 0, updated TEXT
-            )""")
-
-    def _get_session(self) -> str | None:
-        """Return session_id if under turn limit, else None (forces fresh session)."""
-        import sqlite3
-
-        with sqlite3.connect(self._DB) as con:
-            row = con.execute(
-                "SELECT session_id, turns FROM sessions WHERE cwd=?",
-                (str(Path(_work_dir).resolve()),),
-            ).fetchone()
-        if not row:
-            return None
-        session_id, turns = row
-        if turns >= self._MAX_TURNS:
-            return None  # expired — next call starts fresh
-        return session_id
-
-    def _put_session(self, session_id: str, increment: bool = True):
-        import sqlite3
-        from datetime import datetime
-
-        cwd = str(Path(_work_dir).resolve())
-        with sqlite3.connect(self._DB) as con:
-            if increment:
-                con.execute(
-                    """INSERT INTO sessions (cwd, session_id, turns, updated) VALUES (?,?,1,?)
-                    ON CONFLICT(cwd) DO UPDATE SET
-                        session_id=excluded.session_id,
-                        turns=CASE WHEN session_id=excluded.session_id THEN turns+1 ELSE 1 END,
-                        updated=excluded.updated""",
-                    (cwd, session_id, datetime.now().isoformat()),
-                )
-            else:
-                con.execute(
-                    "INSERT OR REPLACE INTO sessions (cwd, session_id, turns, updated) VALUES (?,?,0,?)",
-                    (cwd, session_id, datetime.now().isoformat()),
-                )
 
     def __call__(
         self,
@@ -383,11 +343,10 @@ class ClaudeTool:
             ClaudeAgentOptions,
             AssistantMessage,
             ResultMessage,
-            SystemMessage,
             TextBlock,
         )
+        import threading
 
-        # Resolve parent prompt (last user message in chat)
         parent = ""
         for m in reversed(self._chat.messages):
             if m["role"] == "user":
@@ -395,7 +354,6 @@ class ClaudeTool:
                 break
 
         if not prompt and pass_parent_prompt:
-            # Kivi left prompt empty — user's message IS the task, send it directly
             final_prompt = parent
         else:
             context_parts = []
@@ -413,71 +371,156 @@ class ClaudeTool:
                 else prompt
             )
 
-        resume = self._get_session()
-
+        # Always fresh — independent sub-agent tasks must not share context
         opts = ClaudeAgentOptions(
             model=self._MODEL,
             permission_mode="bypassPermissions",
-            resume=resume,
             cwd=_work_dir,
         )
 
         async def _run():
-            text, sid = "", None
+            text = ""
             async for msg in query(prompt=final_prompt, options=opts):
-                if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                    sid = msg.data.get("session_id")
-                elif isinstance(msg, AssistantMessage):
+                if isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             text += block.text
-                elif isinstance(msg, ResultMessage):
-                    sid = msg.session_id
-            return text, sid
+            return text
 
         try:
-            text, sid = asyncio.run(_run())
+            # asyncio.run() fails if called from a thread with a running loop;
+            # run in a dedicated thread to always get a fresh event loop.
+            result_box: list = []
+            exc_box: list = []
+            def _thread_run():
+                try:
+                    result_box.append(asyncio.run(_run()))
+                except Exception as e:
+                    exc_box.append(e)
+            t = threading.Thread(target=_thread_run, daemon=True)
+            t.start()
+            t.join()
+            if exc_box:
+                raise exc_box[0]
+            text = result_box[0] if result_box else ""
         except Exception as e:
             return f"[claude error] {e}"
 
-        if sid:
-            self._put_session(sid)
         return text or "[no response]"
 
 
+# ── Claude usage tracking ─────────────────────────────────────────────────────
+
+_USAGE_DB = Path.home() / ".ai_cli" / "claude_usage.db"
+
+
+def _init_usage_db():
+    import sqlite3
+    _USAGE_DB.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(_USAGE_DB) as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS turns (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            TEXT NOT NULL,
+            cwd           TEXT,
+            session_id    TEXT,
+            resumed       INTEGER DEFAULT 0,
+            prompt_preview TEXT,
+            input_tokens  INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cache_read    INTEGER DEFAULT 0,
+            cache_write   INTEGER DEFAULT 0,
+            cost_usd      REAL DEFAULT 0,
+            cost_inr      REAL DEFAULT 0,
+            limits_before TEXT,
+            limits_after  TEXT
+        )""")
+
+
+def _fetch_limits_json() -> str | None:
+    """Fetch current usage limits from Anthropic API, return raw JSON string or None."""
+    creds_path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        token = json.loads(creds_path.read_text())["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return None
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.0.32",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return resp.read().decode()
+    except Exception:
+        return None
+
+
+def _log_turn(*, cwd: str, session_id: str, resumed: bool, prompt_preview: str,
+               input_tokens: int, output_tokens: int, cache_read: int, cache_write: int,
+               cost_usd: float, limits_before: str | None, limits_after: str | None):
+    import sqlite3
+    from datetime import datetime
+    _init_usage_db()
+    cost_inr = cost_usd * _USD_TO_INR
+    with sqlite3.connect(_USAGE_DB) as con:
+        con.execute(
+            """INSERT INTO turns
+               (ts, cwd, session_id, resumed, prompt_preview,
+                input_tokens, output_tokens, cache_read, cache_write,
+                cost_usd, cost_inr, limits_before, limits_after)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (datetime.now().isoformat(), cwd, session_id, int(resumed), prompt_preview,
+             input_tokens, output_tokens, cache_read, cache_write,
+             cost_usd, cost_inr, limits_before, limits_after),
+        )
+
+
 class ClaudeDirectAgent:
-    """Direct Claude mode — chat with Claude in the REPL with shared context.
-    Maintains session continuity and streams output live.
-    """
+    """Direct Claude mode — 30-min time-windowed session reuse for cache warmth."""
 
     _MODEL = "claude-sonnet-4-6"
     _DB = Path.home() / ".ai_cli" / "claude_direct_sessions.db"
+    _SESSION_TTL_MINUTES = 30
 
     def __init__(self):
         self._DB.parent.mkdir(parents=True, exist_ok=True)
         import sqlite3
-
         with sqlite3.connect(self._DB) as con:
             con.execute("""CREATE TABLE IF NOT EXISTS sessions (
                 cwd TEXT PRIMARY KEY, session_id TEXT, updated TEXT
             )""")
+        # Limits fetched once per session start/resume, not per call
+        self._session_limits: str | None = None
+        self._last_known_session_id: str | None = None
 
-    def _get_session(self) -> str | None:
-        """Get the session_id for current cwd."""
+    def _get_session(self) -> tuple[str | None, bool]:
+        """Return (session_id, resumed). Expires after TTL; fresh otherwise."""
         import sqlite3
-
+        from datetime import datetime, timedelta
         with sqlite3.connect(self._DB) as con:
             row = con.execute(
-                "SELECT session_id FROM sessions WHERE cwd=?",
+                "SELECT session_id, updated FROM sessions WHERE cwd=?",
                 (str(Path(_work_dir).resolve()),),
             ).fetchone()
-        return row[0] if row else None
+        if not row:
+            return None, False
+        session_id, updated_str = row
+        try:
+            updated = datetime.fromisoformat(updated_str)
+            if datetime.now() - updated > timedelta(minutes=self._SESSION_TTL_MINUTES):
+                return None, False  # cache cold — start fresh
+        except Exception:
+            return None, False
+        return session_id, True
 
     def _put_session(self, session_id: str):
-        """Save or update the session_id for current cwd."""
         import sqlite3
         from datetime import datetime
-
         cwd = str(Path(_work_dir).resolve())
         with sqlite3.connect(self._DB) as con:
             con.execute(
@@ -488,7 +531,7 @@ class ClaudeDirectAgent:
     def __call__(
         self, prompt: str, chat: "Chat", plan_mode: bool = False
     ) -> tuple[str, str | None]:
-        """Stream Claude response with chat context. Returns (full_text, session_id)."""
+        """Stream Claude response. Returns (full_text, session_id)."""
         import asyncio
         from claude_agent_sdk import (
             query,
@@ -500,26 +543,28 @@ class ClaudeDirectAgent:
             TextBlock,
         )
 
-        # Build context from last N non-system messages
         context_lines = []
         for m in chat.messages:
             if m["role"] == "system":
                 continue
-            role = m["role"]
             content = m.get("content", "")
             if isinstance(content, str):
-                lines = content.split("\n")
-                preview = lines[0][:100]
-                context_lines.append(f"{role}: {preview}")
-
+                context_lines.append(f"{m['role']}: {content.split(chr(10))[0][:100]}")
         context = "\n".join(context_lines[-10:]) if context_lines else ""
         final_prompt = (
-            f"[Chat context]\n{context}\n\n[New message]\n{prompt}"
-            if context
-            else prompt
+            f"[Chat context]\n{context}\n\n[New message]\n{prompt}" if context else prompt
         )
 
-        resume = self._get_session()
+        resume, resumed = self._get_session()
+
+        # Fetch limits only when session changes (start or resume after expiry)
+        if resume != self._last_known_session_id:
+            self._session_limits = _fetch_limits_json()
+            self._last_known_session_id = resume
+        limits_before = self._session_limits
+        resume_label = f"{DIM}[resuming session]{RESET}" if resumed else f"{DIM}[fresh session]{RESET}"
+        print(resume_label, flush=True)
+
         opts = ClaudeAgentOptions(
             model=self._MODEL,
             permission_mode="bypassPermissions",
@@ -528,6 +573,8 @@ class ClaudeDirectAgent:
             disallowed_tools=["Edit"] if plan_mode else [],
             include_partial_messages=True,
         )
+
+        usage_data: dict = {}
 
         async def _run():
             text, sid = "", None
@@ -541,18 +588,14 @@ class ClaudeDirectAgent:
                         cb = ev.get("content_block", {})
                         if cb.get("type") == "tool_use":
                             in_text_block = False
-                            print(
-                                f"\n{DIM}[claude:{cb['name']}]{RESET} ",
-                                end="",
-                                flush=True,
-                            )
+                            print(f"\n{DIM}[claude:{cb['name']}]{RESET} ", end="", flush=True)
                         elif cb.get("type") == "text":
                             in_text_block = True
                             cur_live = StreamText()
                             cur_live.start()
                     elif ev_type == "content_block_stop":
                         if not in_text_block:
-                            print(flush=True)  # newline after tool call block
+                            print(flush=True)
                         elif cur_live:
                             cur_live.stop()
                             cur_live = None
@@ -565,12 +608,29 @@ class ClaudeDirectAgent:
                             if cur_live:
                                 cur_live.append(chunk)
                         elif delta.get("type") == "input_json_delta":
-                            frag = delta.get("partial_json", "")
-                            print(f"{DIM}{frag}{RESET}", end="", flush=True)
+                            print(f"{DIM}{delta.get('partial_json','')}{RESET}", end="", flush=True)
                 elif isinstance(msg, SystemMessage) and msg.subtype == "init":
                     sid = msg.data.get("session_id")
                 elif isinstance(msg, ResultMessage):
                     sid = msg.session_id
+                    u = msg.usage or {}
+                    cost = msg.total_cost_usd or 0.0
+                    usage_data.update(
+                        input_tokens=u.get("input_tokens", 0),
+                        output_tokens=u.get("output_tokens", 0),
+                        cache_read=u.get("cache_read_input_tokens", 0),
+                        cache_write=u.get("cache_creation_input_tokens", 0),
+                        cost_usd=cost,
+                    )
+                    inp = u.get("input_tokens", 0)
+                    out = u.get("output_tokens", 0)
+                    cr  = u.get("cache_read_input_tokens", 0)
+                    cw  = u.get("cache_creation_input_tokens", 0)
+                    parts = [f"in={inp}", f"out={out}"]
+                    if cr: parts.append(f"cache_read={cr}")
+                    if cw: parts.append(f"cache_write={cw}")
+                    cost_str = f"  ${cost:.6f} (₹{cost * _USD_TO_INR:.4f})" if cost else ""
+                    print(f"\n{DIM}[claude · {'  '.join(parts)}{cost_str}]{RESET}", flush=True)
             return text, sid
 
         try:
@@ -580,6 +640,21 @@ class ClaudeDirectAgent:
 
         if sid:
             self._put_session(sid)
+
+        _log_turn(
+            cwd=str(Path(_work_dir).resolve()),
+            session_id=sid or "",
+            resumed=resumed,
+            prompt_preview=prompt[:120],
+            input_tokens=usage_data.get("input_tokens", 0),
+            output_tokens=usage_data.get("output_tokens", 0),
+            cache_read=usage_data.get("cache_read", 0),
+            cache_write=usage_data.get("cache_write", 0),
+            cost_usd=usage_data.get("cost_usd", 0.0),
+            limits_before=limits_before,
+            limits_after=None,
+        )
+
         return text or "[no response]", sid
 
 
@@ -600,12 +675,8 @@ class OpenCodeTool:
             for event in agent.run(prompt):
                 if isinstance(event, Text):
                     text_parts.append(event.content)
-                    print(event.content, end="", flush=True)
-                elif isinstance(event, ToolCall):
-                    print(f"\n{DIM}[opencode:{event.name}]{RESET}", flush=True)
                 elif isinstance(event, AgentResult):
-                    if text_parts:
-                        print()
+                    pass
         except FileNotFoundError:
             return "[opencode error] opencode not found in PATH"
         result = "".join(text_parts).lstrip("\n")
@@ -1196,6 +1267,311 @@ def pick_mode(current: str) -> str:
     return curses.wrapper(_inner)
 
 
+# ── /usage — read ~/.claude/stats-cache.json ─────────────────────────────────
+
+_USD_TO_INR = 92.60
+
+def _show_usage():
+    stats_path = Path.home() / ".claude" / "stats-cache.json"
+    try:
+        data = json.loads(stats_path.read_text())
+    except Exception as e:
+        print(f"{RED}[usage error] {e}{RESET}")
+        return
+
+    from datetime import date
+    today = str(date.today())
+
+    # ── today's tokens ──────────────────────────────────────────────────
+    today_tokens: dict[str, int] = {}
+    for entry in data.get("dailyModelTokens", []):
+        if entry["date"] == today:
+            today_tokens = entry.get("tokensByModel", {})
+            break
+
+    # ── all-time model usage ─────────────────────────────────────────────
+    model_usage: dict = data.get("modelUsage", {})
+
+    # only show claude models
+    CLAUDE_MODELS = {k: v for k, v in model_usage.items() if "claude" in k.lower()}
+
+    print(f"\n{BOLD}Claude Usage{RESET}  {DIM}(from ~/.claude/stats-cache.json){RESET}\n")
+
+    # today summary
+    if today_tokens:
+        print(f"  {BOLD}Today ({today}){RESET}")
+        for model, tok in sorted(today_tokens.items()):
+            if "claude" in model.lower():
+                short = model.split("/")[-1]
+                print(f"    {CYAN}{short:<32}{RESET} {DIM}{tok:>10,} tokens{RESET}")
+        print()
+
+    # all-time per model
+    if CLAUDE_MODELS:
+        print(f"  {BOLD}All-time by model{RESET}")
+        total_in = total_out = total_cache_r = total_cache_w = 0
+        for model, u in sorted(CLAUDE_MODELS.items()):
+            short = model.split("/")[-1]
+            inp   = u.get("inputTokens", 0)
+            out   = u.get("outputTokens", 0)
+            cr    = u.get("cacheReadInputTokens", 0)
+            cw    = u.get("cacheCreationInputTokens", 0)
+            total_in += inp; total_out += out; total_cache_r += cr; total_cache_w += cw
+            print(f"    {CYAN}{short:<32}{RESET}  in={inp:>10,}  out={out:>10,}  cache_r={cr:>12,}  cache_w={cw:>10,}")
+        print(f"    {DIM}{'TOTAL':<32}  in={total_in:>10,}  out={total_out:>10,}  cache_r={total_cache_r:>12,}  cache_w={total_cache_w:>10,}{RESET}")
+        print()
+
+    # overall stats
+    print(f"  {BOLD}Overall{RESET}")
+    print(f"    {DIM}Total sessions : {data.get('totalSessions', 0):,}{RESET}")
+    print(f"    {DIM}Total messages : {data.get('totalMessages', 0):,}{RESET}")
+    print(f"    {DIM}First session  : {data.get('firstSessionDate', 'n/a')}{RESET}")
+    print(f"    {DIM}Last computed  : {data.get('lastComputedDate', 'n/a')}{RESET}")
+    print()
+
+
+# ── /limits — live usage limits from Anthropic OAuth API ──────────────────────
+
+def _show_limits():
+    creds_path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        creds = json.loads(creds_path.read_text())
+        token = creds["claudeAiOauth"]["accessToken"]
+        sub   = creds["claudeAiOauth"].get("subscriptionType", "?")
+        tier  = creds["claudeAiOauth"].get("rateLimitTier", "")
+    except Exception as e:
+        print(f"{RED}[limits error] can't read credentials: {e}{RESET}")
+        return
+
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.0.32",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"{RED}[limits error] HTTP {e.code}: {e.reason}{RESET}")
+        return
+    except Exception as e:
+        print(f"{RED}[limits error] {e}{RESET}")
+        return
+
+    def _bar(pct: float, width: int = 28) -> str:
+        filled = int(width * pct / 100)
+        bar = "█" * filled + "░" * (width - filled)
+        color = RED if pct >= 80 else YELLOW if pct >= 50 else GREEN
+        return f"{color}{bar}{RESET}"
+
+    def _fmt_reset(ts: str | None) -> str:
+        if not ts:
+            return ""
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(ts)
+            now = datetime.now(timezone.utc)
+            total = int((dt - now).total_seconds())
+            if total <= 0:
+                return "resets now"
+            h, rem = divmod(total, 3600)
+            m = rem // 60
+            return f"resets in {h}h {m}m  ({dt.strftime('%b %d %H:%M')} UTC)"
+        except Exception:
+            return ts or ""
+
+    def _label(key: str) -> str:
+        return key.replace("_", " ").title()
+
+    tier_str = f"  tier={tier}" if tier else ""
+    print(f"\n{BOLD}Claude Usage Limits{RESET}  {DIM}plan={sub}{tier_str}{RESET}\n")
+
+    # Separate window limits from extra_usage
+    skip = {"extra_usage"}
+    window_keys = [k for k, v in data.items() if k not in skip and isinstance(v, dict) and v.get("utilization") is not None]
+    null_keys   = [k for k, v in data.items() if k not in skip and v is None]
+
+    if window_keys:
+        col = max(len(_label(k)) for k in window_keys) + 2
+        for key in window_keys:
+            val = data[key]
+            pct = val.get("utilization", 0.0)
+            reset_str = _fmt_reset(val.get("resets_at"))
+            label = _label(key)
+            pct_col = RED if pct >= 80 else YELLOW if pct >= 50 else GREEN
+            print(f"  {CYAN}{label:<{col}}{RESET}  {_bar(pct)}  {pct_col}{pct:>5.1f}%{RESET}  {DIM}{reset_str}{RESET}")
+
+    if null_keys:
+        print(f"\n  {DIM}not active: {', '.join(_label(k) for k in null_keys)}{RESET}")
+
+    extra = data.get("extra_usage", {})
+    if extra:
+        print(f"\n  {BOLD}Extra Usage{RESET}")
+        enabled = extra.get("is_enabled", False)
+        print(f"    enabled       : {GREEN+'yes'+RESET if enabled else DIM+'no'+RESET}")
+        if enabled or extra.get("used_credits") is not None:
+            used  = extra.get("used_credits") or 0
+            limit = extra.get("monthly_limit") or 0
+            curr  = extra.get("currency") or "USD"
+            inr   = used * _USD_TO_INR
+            print(f"    used          : {used} {curr}  (₹{inr:.2f})")
+            print(f"    monthly limit : {limit} {curr}")
+            if extra.get("utilization") is not None:
+                print(f"    utilization   : {extra['utilization']}%")
+
+    print()
+
+
+# ── /insights ────────────────────────────────────────────────────────────────
+
+def _show_insights():
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    _init_usage_db()
+    if not _USAGE_DB.exists():
+        print(f"{DIM}no usage data yet — use /claude mode to start tracking{RESET}")
+        return
+
+    with sqlite3.connect(_USAGE_DB) as con:
+        rows = con.execute(
+            "SELECT ts, session_id, resumed, prompt_preview, input_tokens, output_tokens, "
+            "cache_read, cache_write, cost_usd, cost_inr, limits_before, limits_after "
+            "FROM turns ORDER BY ts DESC LIMIT 500"
+        ).fetchall()
+
+    if not rows:
+        print(f"{DIM}no usage data yet{RESET}")
+        return
+
+    cols = ["ts","session_id","resumed","prompt_preview","input_tokens","output_tokens",
+            "cache_read","cache_write","cost_usd","cost_inr","limits_before","limits_after"]
+    turns = [dict(zip(cols, r)) for r in rows]
+    turns.reverse()  # oldest first for trend
+
+    # ── aggregate by day ────────────────────────────────────────────────
+    from collections import defaultdict
+    daily: dict[str, dict] = defaultdict(lambda: dict(cost=0.0, inp=0, out=0, cr=0, cw=0, n=0))
+    for t in turns:
+        day = t["ts"][:10]
+        daily[day]["cost"] += t["cost_usd"] or 0
+        daily[day]["inp"]  += t["input_tokens"] or 0
+        daily[day]["out"]  += t["output_tokens"] or 0
+        daily[day]["cr"]   += t["cache_read"] or 0
+        daily[day]["cw"]   += t["cache_write"] or 0
+        daily[day]["n"]    += 1
+
+    days = sorted(daily.keys())[-14:]  # last 14 days
+
+    def _spark(values: list[float], width: int = 1) -> str:
+        bars = " ▁▂▃▄▅▆▇█"
+        if not values or max(values) == 0:
+            return "▁" * len(values)
+        mx = max(values)
+        return "".join(bars[min(8, int(v / mx * 8))] for v in values)
+
+    # ── totals ──────────────────────────────────────────────────────────
+    total_cost = sum(t["cost_usd"] or 0 for t in turns)
+    total_inp  = sum(t["input_tokens"] or 0 for t in turns)
+    total_out  = sum(t["output_tokens"] or 0 for t in turns)
+    total_cr   = sum(t["cache_read"] or 0 for t in turns)
+    total_cw   = sum(t["cache_write"] or 0 for t in turns)
+    total_turns = len(turns)
+    sessions = len(set(t["session_id"] for t in turns if t["session_id"]))
+    resumed_count = sum(1 for t in turns if t["resumed"])
+    fresh_count   = total_turns - resumed_count
+
+    print(f"\n{BOLD}Claude Usage Insights{RESET}  {DIM}({total_turns} turns tracked){RESET}\n")
+
+    # ── summary row ─────────────────────────────────────────────────────
+    print(f"  {BOLD}All-time{RESET}")
+    print(f"    cost          : {GREEN}${total_cost:.6f}{RESET}  {DIM}(₹{total_cost * _USD_TO_INR:.4f}){RESET}")
+    print(f"    input tokens  : {total_inp:,}")
+    print(f"    output tokens : {total_out:,}")
+    print(f"    cache read    : {CYAN}{total_cr:,}{RESET}  {DIM}(saves ~${total_cr * 0.000003:.4f}){RESET}")
+    print(f"    cache write   : {total_cw:,}")
+    print(f"    sessions      : {sessions}  {DIM}(resumed={resumed_count}  fresh={fresh_count}){RESET}")
+    print()
+
+    # ── daily cost sparkline ─────────────────────────────────────────────
+    if days:
+        costs = [daily[d]["cost"] for d in days]
+        spark = _spark(costs)
+        print(f"  {BOLD}Cost trend (last {len(days)} days){RESET}")
+        print(f"    {YELLOW}{spark}{RESET}")
+        print(f"    {DIM}{days[0]}{'':>10}{days[-1]}{RESET}")
+        print()
+
+        # per-day table (last 7)
+        print(f"  {BOLD}Daily breakdown{RESET}")
+        header = f"    {'date':<12} {'turns':>5} {'cost':>10} {'inp':>8} {'out':>8} {'cache_r':>10}"
+        print(f"{DIM}{header}{RESET}")
+        for d in days[-7:]:
+            dd = daily[d]
+            cost_col = YELLOW if dd["cost"] > 0.01 else DIM
+            print(f"    {CYAN}{d}{RESET}  {dd['n']:>5}  "
+                  f"{cost_col}${dd['cost']:>8.6f}{RESET}  "
+                  f"{dd['inp']:>8,}  {dd['out']:>8,}  {CYAN}{dd['cr']:>10,}{RESET}")
+        print()
+
+    # ── cache efficiency ────────────────────────────────────────────────
+    total_readable = total_inp + total_cr
+    cache_pct = (total_cr / total_readable * 100) if total_readable else 0
+    bar_w = 30
+    filled = int(bar_w * cache_pct / 100)
+    bar = f"{CYAN}{'█' * filled}{DIM}{'░' * (bar_w - filled)}{RESET}"
+    print(f"  {BOLD}Cache efficiency{RESET}")
+    print(f"    {bar}  {CYAN}{cache_pct:.1f}%{RESET} of reads served from cache")
+    print()
+
+    # ── session strategy ────────────────────────────────────────────────
+    print(f"  {BOLD}Session strategy{RESET}")
+    print(f"    resumed  : {resumed_count:>4}  {DIM}(warm cache, cheaper){RESET}")
+    print(f"    fresh    : {fresh_count:>4}  {DIM}(cold start, full cost){RESET}")
+    print()
+
+    # ── 5h limit trend from stored snapshots ────────────────────────────
+    snapshots = []
+    for t in turns[-20:]:
+        for key in ("limits_after", "limits_before"):
+            raw = t.get(key)
+            if raw:
+                try:
+                    d = json.loads(raw)
+                    fh = d.get("five_hour")
+                    if fh and fh.get("utilization") is not None:
+                        snapshots.append((t["ts"][:16], fh["utilization"]))
+                        break
+                except Exception:
+                    pass
+
+    if snapshots:
+        utils = [u for _, u in snapshots]
+        spark = _spark(utils)
+        print(f"  {BOLD}5-hour limit pressure (last {len(utils)} snapshots){RESET}")
+        color = RED if utils[-1] >= 80 else YELLOW if utils[-1] >= 50 else GREEN
+        print(f"    {color}{spark}{RESET}  current={color}{utils[-1]:.0f}%{RESET}")
+        print(f"    {DIM}{snapshots[0][0]}  →  {snapshots[-1][0]}{RESET}")
+        print()
+
+    # ── top 5 costliest turns ────────────────────────────────────────────
+    costly = sorted(turns, key=lambda t: t["cost_usd"] or 0, reverse=True)[:5]
+    if any(t["cost_usd"] for t in costly):
+        print(f"  {BOLD}Top 5 costliest turns{RESET}")
+        for t in costly:
+            cost = t["cost_usd"] or 0
+            if not cost:
+                continue
+            preview = (t["prompt_preview"] or "")[:50].replace("\n", " ")
+            print(f"    {DIM}{t['ts'][:16]}{RESET}  {YELLOW}${cost:.6f}{RESET}  {DIM}{preview}{RESET}")
+        print()
+
+
 # ── prompt_toolkit session ────────────────────────────────────────────
 _pt_style = Style.from_dict({"prompt": "bold", "bottom-toolbar": "bg:#1a1a1a #888888"})
 _SLASH_COMMANDS = [
@@ -1212,6 +1588,9 @@ _SLASH_COMMANDS = [
     "/opencode",
     "/copilot",
     "/model",
+    "/usage",
+    "/limits",
+    "/insights",
     "/quit",
 ]
 
@@ -1356,7 +1735,8 @@ def _build_system_prompt(tools: list) -> str:
     """Build system prompt dynamically from the actual resolved tool schemas."""
     from ai_sync import AIAgent, AIConfig
 
-    agent = AIAgent(config=AIConfig(base_url="http://localhost/v1"), tools=tools)
+    base_url = os.environ.get("OPENAI_BASE_URL", "http://192.168.170.76:8000/v1")
+    agent = AIAgent(config=AIConfig(base_url=base_url), tools=tools)
     schemas = agent._resolve_tools(tools)
 
     lines = [
@@ -1558,6 +1938,9 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
                     ("/opencode", "switch to OpenCode mode"),
                     ("/copilot [prompt]", "switch to/ask GitHub Copilot CLI"),
                     ("/model [name]", "pick copilot model"),
+                    ("/usage", "show Claude token usage from stats-cache"),
+                    ("/limits", "show live 5h/7d usage limits from Anthropic API"),
+                    ("/insights", "show cost/token trends from usage log"),
                     ("/quit", "quit"),
                 ]:
                     print(f"  {CYAN}{c:<16}{RESET} {d}")
@@ -1653,6 +2036,12 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
                         print(
                             f"{marker}{CYAN}{r['id']}{RESET}  {r['updated']}  {DIM}{r['title']}{RESET}"
                         )
+            elif cmd == "/usage":
+                _show_usage()
+            elif cmd == "/limits":
+                _show_limits()
+            elif cmd == "/insights":
+                _show_insights()
             elif cmd in ("/quit", "/exit"):
                 print(f"{DIM}bye{RESET}")
                 break
