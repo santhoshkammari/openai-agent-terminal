@@ -2889,11 +2889,10 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
     session = make_session(session_id, work_dir, key_bindings=keybindings)
 
     ac = AGENT_COLOR.get(current_agent, CORAL)
-    print(f"""
-            kivi v1.0 · AI Agent
+    print(f"""           kivi v1.0 · AI Agent
  ▐▛███▜▌   {_work_dir}
 ▝▜█████▛▘  {DIM}endpoint: {base_url}{RESET}
-  ▘▘ ▝▝    {DIM}{'resumed ' if resumed else ''}session {RESET}{CREAM}{session_id}{RESET}"{DIM}|{RESET}  mode: {CREAM}{current_mode}{RESET}"{DIM}|{RESET}  agent: {ac}{BOLD}{current_agent}{RESET}"{DIM}|{RESET}  plan: {CREAM}{'[plan]' if repl_mode_container[0] == 'plan' else '[build]'}{RESET}""" 
+  ▘▘ ▝▝    {DIM}{'resumed ' if resumed else ''}session {RESET}{CREAM}{session_id}{RESET}"{DIM}|{RESET}  mode: {CREAM}{current_mode}{RESET}"{DIM}|{RESET}  agent: {ac}{BOLD}{current_agent}{RESET}"{DIM}""" 
     )
     if resumed and initial_history:
         _render_history(initial_history)
