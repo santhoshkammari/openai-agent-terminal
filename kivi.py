@@ -3,6 +3,7 @@
 Start interactive REPL or run single prompts.
 Commands: /help /modes /clear /history /quit /claude /kivi
 Use bash, read, edit, glob, grep tools.
+
 """
 
 import os, sys, json, subprocess, threading, time, itertools
