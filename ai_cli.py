@@ -416,10 +416,6 @@ class Chat:
                 return msg["content"]
         return ""
 
-    @property
-    def stop(self) -> bool:
-        return self._messages[-1]['role'] != 'assistant'
-
     def __repr__(self) -> str:
         return f"Chat(messages={json.dumps(self._messages, indent=2)})"
 
@@ -1360,7 +1356,6 @@ def kivi(prompt: str) -> str:
     Use this to delegate tasks to a parallel AI agent that can use all the same tools."""
     try:
         base_url = os.environ.get("OPENAI_BASE_URL", "http://192.168.170.76:8000/v1")
-        from ai_sync import AIAgent, AIConfig, Chat, Text, ToolCall, ToolResult, AgentResult, StepResult
         sub_chat = Chat()
         sub_tools = [read, write, edit, bash, glob, grep, web_search, web_fetch]
         sub_chat._messages.append({"role": "system", "content": _build_system_prompt(sub_tools)})
@@ -2792,8 +2787,6 @@ def _expand_at_directives(prompt: str, work_dir: str) -> str:
 
 def _build_system_prompt(tools: list) -> str:
     """Build system prompt dynamically from the actual resolved tool schemas."""
-    from ai_sync import AIAgent, AIConfig
-
     base_url = os.environ.get("OPENAI_BASE_URL", "http://192.168.170.76:8000/v1")
     agent = AIAgent(config=AIConfig(base_url=base_url), tools=tools)
     schemas = agent._resolve_tools(tools)
@@ -2897,17 +2890,11 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
 
     ac = AGENT_COLOR.get(current_agent, CORAL)
     print(f"""
-               {BOLD}ai_cli{RESET} v1.0
-     ▐▛███▜▌   kivi v1.0 · AI Agent
-    ▝▜█████▛▘  {_work_dir}
-      ▘▘ ▝▝    {DIM}endpoint: {base_url}{RESET}""")
-    print(
-        f"  {DIM}{'resumed ' if resumed else ''}session {RESET}{CREAM}{session_id}{RESET}"
-        f"  {DIM}|{RESET}  mode: {CREAM}{current_mode}{RESET}"
-        f"  {DIM}|{RESET}  agent: {ac}{BOLD}{current_agent}{RESET}"
-        f"  {DIM}|{RESET}  plan: {CREAM}{'[plan]' if repl_mode_container[0] == 'plan' else '[build]'}{RESET}"
+            kivi v1.0 · AI Agent
+ ▐▛███▜▌   {_work_dir}
+▝▜█████▛▘  {DIM}endpoint: {base_url}{RESET}
+  ▘▘ ▝▝    {DIM}{'resumed ' if resumed else ''}session {RESET}{CREAM}{session_id}{RESET}"{DIM}|{RESET}  mode: {CREAM}{current_mode}{RESET}"{DIM}|{RESET}  agent: {ac}{BOLD}{current_agent}{RESET}"{DIM}|{RESET}  plan: {CREAM}{'[plan]' if repl_mode_container[0] == 'plan' else '[build]'}{RESET}""" 
     )
-    print(f"  {DIM}/help for commands, Ctrl-C to quit{RESET}\n")
     if resumed and initial_history:
         _render_history(initial_history)
 
@@ -3592,45 +3579,27 @@ class AICli:
             if not args.tools:
                 args.tools = ",".join(cls.FILE_TOOLS + ["web_search", "web_fetch"])
 
-        # ── db / session helpers ───────────────────────────────────────────
-        def _db():
-            try:
-                from db import (
-                    new_session_id, save_session, load_session,
-                    latest_session_for_dir, title_from_history,
-                )
-                return new_session_id, save_session, load_session, latest_session_for_dir, title_from_history
-            except ImportError:
-                return None
-
         session_id = None
         prior_history = None
-        db_fns = _db()
 
-        if db_fns:
-            new_session_id_fn, save_session_fn, load_session_fn, latest_for_dir_fn, title_fn = db_fns
-
-            if args.resume:
-                rec = load_session_fn(args.resume)
-                if not rec:
-                    print(f"\033[31msession {args.resume!r} not found\033[0m")
-                    sys.exit(1)
+        if args.resume:
+            rec = load_session(args.resume)
+            if not rec:
+                print(f"\033[31msession {args.resume!r} not found\033[0m")
+                sys.exit(1)
+            session_id = rec["id"]
+            prior_history = rec["history"]
+            _work_dir = rec.get("work_dir") or work_dir
+        elif args.continue_:
+            rec = latest_session_for_dir(work_dir)
+            if rec:
                 session_id = rec["id"]
                 prior_history = rec["history"]
-                _work_dir = rec.get("work_dir") or work_dir
-            elif args.continue_:
-                rec = latest_for_dir_fn(work_dir)
-                if rec:
-                    session_id = rec["id"]
-                    prior_history = rec["history"]
-                else:
-                    print(f"\033[2mno session found for {work_dir}, starting fresh\033[0m")
+            else:
+                print(f"\033[2mno session found for {work_dir}, starting fresh\033[0m")
 
-            if session_id is None:
-                session_id = new_session_id_fn()
-        else:
-            import uuid
-            session_id = uuid.uuid4().hex[:8]
+        if session_id is None:
+            session_id = new_session_id()
 
         # ── batch mode ─────────────────────────────────────────────────────
         if args.batch:
