@@ -44,6 +44,7 @@ _work_dir = "."
 _python_env = sys.executable
 
 
+
 def _strip_ansi(s: str) -> str:
     return _re.sub(r'\033\[[0-9;]*m', '', s)
 
