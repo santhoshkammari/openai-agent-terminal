@@ -70,31 +70,64 @@ def _is_sep(row: list[str]) -> bool:
     return bool(row) and all(_re.match(r'^:?-{1,}:?$', c) for c in row if c)
 
 
+def _ratio_distribute(total: int, widths: list[int]) -> list[int]:
+    """Distribute `total` extra chars equally across columns (round-robin for remainder)."""
+    if not widths or total <= 0:
+        return widths[:]
+    n       = len(widths)
+    each    = total // n
+    leftover = total % n
+    return [w + each + (1 if i < leftover else 0) for i, w in enumerate(widths)]
+
+
 def _render_table(all_lines: list[str]) -> list[str]:
-    parsed = [_parse_row(l) for l in all_lines]
-    # find separator row
+    parsed  = [_parse_row(l) for l in all_lines]
     sep_idx = next((i for i, r in enumerate(parsed) if _is_sep(r)), 1)
-    headers = parsed[0] if parsed else []
+    headers = list(parsed[0]) if parsed else []
     rows    = [r for i, r in enumerate(parsed) if i != 0 and i != sep_idx]
     ncols   = max(len(headers), max((len(r) for r in rows), default=0))
-    # pad all rows to ncols
     while len(headers) < ncols: headers.append("")
     rows = [r + [""] * (ncols - len(r)) for r in rows]
 
-    # column widths = max of header + all cells (raw text, no ANSI)
-    widths = [len(headers[c]) for c in range(ncols)]
+    # ── Step 1: natural column widths (content only, no padding) ────────────
+    nat = [len(headers[c]) for c in range(ncols)]
     for row in rows:
         for c in range(ncols):
-            widths[c] = max(widths[c], len(row[c]))
+            nat[c] = max(nat[c], len(row[c]))
+
+    # ── Step 2: fit to terminal ──────────────────────────────────────────────
+    # total width = sum(nat) + 1 padding each side per col + (ncols+1) borders
+    try:
+        term_w = os.get_terminal_size().columns
+    except OSError:
+        term_w = 80
+    border_overhead = ncols + 1          # one │ per column + leading │
+    padding_overhead = ncols * 2         # 1 space each side per column
+    available = term_w - border_overhead - padding_overhead
+
+    # shrink: if natural widths exceed available, reduce widest columns first
+    while sum(nat) > available and max(nat) > 1:
+        mx = max(nat)
+        for i in range(ncols):
+            if nat[i] == mx:
+                nat[i] -= 1
+                break
+
+    # ── Step 3: expand to fill full terminal width ───────────────────────────
+    slack = available - sum(nat)
+    if slack > 0:
+        nat = _ratio_distribute(slack, nat)
+
+    widths = nat
 
     def hline(l, m, r, f="─"):
-        return f"{_TB}{l}{(f'{m}').join(f * (w + 2) for w in widths)}{r}{_RST}"
+        return f"{_TB}{l}{m.join(f * (w + 2) for w in widths)}{r}{_RST}"
 
     def fmt_row(cells, header=False, bg=""):
         parts = []
         for c, w in enumerate(widths):
-            raw  = cells[c] if c < len(cells) else ""
-            pad  = w - len(raw)        # padding based on raw length before ANSI
+            raw    = cells[c] if c < len(cells) else ""
+            pad    = w - len(raw)
             styled = _inline(raw)
             if header:
                 parts.append(f" {_THB}{_TH}{_BOLD}{styled}{_RST}{_THB}{' ' * pad} {_RST}")
@@ -166,14 +199,22 @@ def _print_markdown(text: str):
             out.append(f"{_BORD}{'─' * tw}{_RST}"); i += 1; continue
 
         # ── table: collect consecutive pipe-containing lines ─────────────────
+        # allow blank lines between rows (model sometimes adds them)
         if "|" in line:
             tbl = []
-            while i < len(lines) and "|" in lines[i]:
-                tbl.append(lines[i]); i += 1
-            if len(tbl) >= 2:
+            while i < len(lines):
+                l = lines[i]
+                if "|" in l:
+                    tbl.append(l); i += 1
+                elif l.strip() == "" and i + 1 < len(lines) and "|" in lines[i + 1]:
+                    i += 1  # skip blank line between rows
+                else:
+                    break
+            if len(tbl) >= 2 and _is_sep(_parse_row(tbl[min(1, len(tbl)-1)])):
                 out.extend(_render_table(tbl))
             else:
-                out.append(_inline(tbl[0]))
+                for tl in tbl:
+                    out.append(_inline(tl))
             continue
 
         # ── blockquote ───────────────────────────────────────────────────────
@@ -475,7 +516,148 @@ import json
 import time
 import inspect
 import concurrent.futures
-from openai import OpenAI
+import urllib.request
+import urllib.error
+import http.client
+
+
+# ── Pure-Python OpenAI-compatible client ─────────────────────────────────────
+
+class _Obj:
+    """Recursively converts a dict into attribute-accessible object."""
+    def __init__(self, d: dict):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                setattr(self, k, _Obj(v))
+            elif isinstance(v, list):
+                setattr(self, k, [_Obj(x) if isinstance(x, dict) else x for x in v])
+            else:
+                setattr(self, k, v)
+    def __repr__(self):
+        return f"_Obj({self.__dict__})"
+    # safe attribute access — return None for missing keys like the SDK does
+    def __getattr__(self, name):
+        return None
+
+
+class _SSEStream:
+    """Iterates over SSE lines from an http.client.HTTPResponse, yields _Obj chunks."""
+
+    def __init__(self, resp: http.client.HTTPResponse):
+        self._resp = resp
+
+    def __iter__(self):
+        buf = b""
+        try:
+            while True:
+                chunk = self._resp.read(1)
+                if not chunk:
+                    break
+                buf += chunk
+                # SSE events are separated by double newline
+                while b"\n\n" in buf:
+                    event_bytes, buf = buf.split(b"\n\n", 1)
+                    data = None
+                    for raw in event_bytes.splitlines():
+                        line = raw.decode("utf-8", errors="replace")
+                        if line.startswith("data:"):
+                            data = line[5:].lstrip(" ")
+                    if data is None:
+                        continue
+                    if data.startswith("[DONE]"):
+                        return
+                    try:
+                        yield _Obj(json.loads(data))
+                    except json.JSONDecodeError:
+                        continue
+        finally:
+            self._resp.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self._resp.close()
+
+
+class _Completions:
+    def __init__(self, base_url: str, api_key: str, timeout: float):
+        self._base_url = base_url.rstrip("/")
+        self._api_key  = api_key
+        self._timeout  = timeout
+
+    def create(self, *, model: str, messages: list, stream: bool = False,
+               tools=None, tool_choice=None, temperature=None, top_p=None,
+               max_tokens=None, extra_body: dict = None, **kwargs) -> "_SSEStream | _Obj":
+
+        body: dict = {"model": model, "messages": messages, "stream": stream}
+        if tools       is not None: body["tools"]       = tools
+        if tool_choice is not None: body["tool_choice"] = tool_choice
+        if temperature is not None: body["temperature"] = temperature
+        if top_p       is not None: body["top_p"]       = top_p
+        if max_tokens  is not None: body["max_tokens"]  = max_tokens
+        # pass through any extra standard kwargs
+        for k, v in kwargs.items():
+            if v is not None:
+                body[k] = v
+        # extra_body fields are merged at top level (same as SDK behaviour)
+        if extra_body:
+            body.update(extra_body)
+
+        payload = json.dumps(body).encode()
+        url = f"{self._base_url}/chat/completions"
+
+        # parse host/port/path from url
+        if url.startswith("https://"):
+            scheme, rest = "https", url[8:]
+        else:
+            scheme, rest = "http", url[7:]
+        host_part, _, path = rest.partition("/")
+        path = "/" + path
+        host, _, port_s = host_part.partition(":")
+        port = int(port_s) if port_s else (443 if scheme == "https" else 80)
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+            "Accept": "text/event-stream" if stream else "application/json",
+        }
+
+        if scheme == "https":
+            import ssl
+            conn = http.client.HTTPSConnection(host, port, timeout=self._timeout,
+                                               context=ssl.create_default_context())
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=self._timeout)
+
+        conn.request("POST", path, body=payload, headers=headers)
+        resp = conn.getresponse()
+
+        if resp.status not in (200, 201):
+            body_err = resp.read().decode(errors="replace")
+            raise RuntimeError(f"HTTP {resp.status}: {body_err}")
+
+        if stream:
+            return _SSEStream(resp)
+        else:
+            return _Obj(json.loads(resp.read().decode()))
+
+
+class _Chat:
+    def __init__(self, base_url, api_key, timeout):
+        self.completions = _Completions(base_url, api_key, timeout)
+
+
+class OpenAI:
+    """Pure-Python OpenAI-compatible client (no httpx/openai dependency)."""
+
+    def __init__(self, *, base_url: str = "https://api.openai.com/v1",
+                 api_key: str = "EMPTY", timeout: float = 600.0):
+        self.base_url = base_url.rstrip("/")
+        self.api_key  = api_key
+        self.chat     = _Chat(self.base_url, api_key, timeout)
+
+# ─────────────────────────────────────────────────────────────────────────────
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Dict, Any, Type
 
@@ -890,6 +1072,7 @@ class AIAgent:
             "presence_penalty": mode_config["presence_penalty"],
             "extra_body": {
                 "top_k": mode_config["top_k"],
+                "min_p": mode_config.get("min_p", 0.0),
                 "repetition_penalty": mode_config["repetition_penalty"],
                 "chat_template_kwargs": {"enable_thinking": mode_config["enable_thinking"]}
             }
@@ -2170,20 +2353,31 @@ class StreamText:
     def stop(self) -> str:
         text = "".join(self._buf)
         if text:
-            if sys.stdout.isatty():
-                try:
-                    width = os.get_terminal_size().columns
-                except OSError:
-                    width = 80
-                rows = 0
-                for line in text.splitlines(keepends=True):
-                    rows += max(1, (len(line.rstrip("\n")) + width - 1) // width)
-                # cursor is one line below the last printed line
-                sys.stdout.write(f"\033[{rows}A\r\033[J")
-                sys.stdout.flush()
-                _print_markdown(text)
-            else:
-                print()
+            # clear the streamed plain text line and re-render as markdown
+            sys.stdout.write("\033[2K\r")   # erase current line, go to col 0
+            sys.stdout.flush()
+            # count visual rows the streamed text used, move cursor to its start
+            try:
+                width = os.get_terminal_size().columns
+            except OSError:
+                width = 80
+            rows = 0
+            col  = 0
+            for ch in text:
+                if ch == "\n":
+                    rows += 1
+                    col   = 0
+                else:
+                    col += 1
+                    if col >= width:
+                        rows += 1
+                        col   = 0
+            if rows > 0:
+                sys.stdout.write(f"\033[{rows}A")
+            sys.stdout.write("\033[J")   # erase from cursor to end of screen
+            sys.stdout.flush()
+            print()
+            _print_markdown(text.rstrip("\n"))
         return text
 
 
@@ -2828,8 +3022,43 @@ _SLASH_COMMANDS = [
 ]
 
 
+class _Trie:
+    """Prefix trie over history strings for O(prefix_len) autosuggestion lookup."""
+    def __init__(self):
+        # Each node: dict of char -> child node, plus '_end' -> original string
+        self._root: dict = {}
+
+    def insert(self, s: str):
+        node = self._root
+        for ch in s:
+            if ch not in node:
+                node[ch] = {}
+            node = node[ch]
+        node['_end'] = s   # store the full string at the terminal node
+
+    def suggest(self, prefix: str) -> str | None:
+        """Return the most recently inserted string with this prefix, or None."""
+        node = self._root
+        for ch in prefix:
+            if ch not in node:
+                return None
+            node = node[ch]
+        # DFS to find '_end' — returns first found (insertion order via dict)
+        return self._dfs(node)
+
+    def _dfs(self, node: dict) -> str | None:
+        if '_end' in node:
+            return node['_end']
+        for ch, child in node.items():
+            if ch != '_end':
+                result = self._dfs(child)
+                if result is not None:
+                    return result
+        return None
+
+
 class PromptToolKit:
-    """Raw-terminal prompt: history (↑/↓), tab dropdown, Shift+Tab mode toggle, ANSI color."""
+    """Raw-terminal prompt: history (↑/↓), tab dropdown, Shift+Tab mode toggle, ANSI color, trie autosuggestion."""
 
     RST  = "\033[0m"
     BOLD = "\033[1m"
@@ -2845,6 +3074,10 @@ class PromptToolKit:
         self._mode = repl_mode_container
         self._completions = _SLASH_COMMANDS + [f"/mode {m}" for m in modes]
         self._history: list[str] = load_prompt_inputs(cwd=work_dir)
+        # build trie from history (insert oldest first so newest wins on collision)
+        self._trie = _Trie()
+        for s in self._history:
+            self._trie.insert(s)
 
     # ── ANSI helpers ──────────────────────────────────────────────────────────
 
@@ -2860,13 +3093,26 @@ class PromptToolKit:
             label = agent
         return f"{self.BOLD}{color}{label}> {self.RST}"
 
+    def _get_suggestion(self, buf: str) -> str:
+        """Return the trie suggestion suffix (part after buf), or ''."""
+        if not buf:
+            return ""
+        full = self._trie.suggest(buf)
+        if full and full != buf and full.startswith(buf):
+            return full[len(buf):]
+        return ""
+
     def _redraw(self, prompt_str: str, buf: str, cur: int):
-        """Rewrite the current line: prompt + buffer, place cursor at cur."""
+        """Rewrite the current line: prompt + buffer [+ grey suggestion], cursor at cur."""
+        suggestion = self._get_suggestion(buf) if cur == len(buf) and not buf.startswith("/") else ""
         sys.stdout.write(f"{self._CR}{self._EL}{prompt_str}{buf}")
-        # move cursor back if needed
-        if cur < len(buf):
+        if suggestion:
+            sys.stdout.write(f"{self.GREY}{suggestion}{self.RST}")
+            sys.stdout.write(f"\033[{len(suggestion)}D")
+        elif cur < len(buf):
             sys.stdout.write(f"\033[{len(buf)-cur}D")
         sys.stdout.flush()
+        return suggestion  # caller may need it for → acceptance
 
     def _show_dropdown(self, prompt_str: str, buf: str, matches: list[str], active: int = 0):
         col     = self._hex_fg("#4a9eff")
@@ -2925,6 +3171,7 @@ class PromptToolKit:
         dd_rows    = 0    # dropdown rows currently shown
         tab_matches: list[str] = []
         tab_idx    = 0
+        suggestion = ""   # current trie autosuggestion suffix
 
         fd  = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
@@ -2945,6 +3192,7 @@ class PromptToolKit:
                     text = "".join(buf).strip()
                     if text:
                         self._history.append(text)
+                        self._trie.insert(text)
                         save_prompt_input(self._sid, self._cwd, text)
                     return text
 
@@ -3042,12 +3290,19 @@ class PromptToolKit:
                         sys.stdout.write("\033[D")
                         sys.stdout.flush()
 
-                # ── Arrow Right ──────────────────────────────────────────────
+                # ── Arrow Right — move cursor or accept suggestion ────────────
                 elif key == "\x1b[C":
                     if cur < len(buf):
                         cur += 1
                         sys.stdout.write("\033[C")
                         sys.stdout.flush()
+                    else:
+                        # accept trie suggestion
+                        sug = self._get_suggestion("".join(buf))
+                        if sug:
+                            buf = list("".join(buf) + sug)
+                            cur = len(buf)
+                            self._redraw(prompt_str, "".join(buf), cur)
 
                 # ── Home / End ───────────────────────────────────────────────
                 elif key in ("\x1b[H", "\x01"):   # Home or Ctrl-A
@@ -3229,7 +3484,9 @@ def _render_history(history: list):
                 if non_system[j].get("role") == "assistant":
                     ac = non_system[j].get("content") or ""
                     if isinstance(ac, str) and ac.strip():
+                        print()
                         _print_markdown(ac.strip())
+                        print()
                 j += 1
             i = j
         else:
