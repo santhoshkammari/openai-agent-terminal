@@ -923,7 +923,7 @@ class AIAgent:
             return c
         return messages
 
-    def __init__(self, config: AIConfig = None, tools=None, name: str = None, description: str = None) -> None:
+    def __init__(self, config: AIConfig = None, tools=None, name = None, description = None) -> None:
         self._name = name
         self._description = description
         if config is None:
@@ -2376,7 +2376,6 @@ class StreamText:
                 sys.stdout.write(f"\033[{rows}A")
             sys.stdout.write("\033[J")   # erase from cursor to end of screen
             sys.stdout.flush()
-            print()
             _print_markdown(text.rstrip("\n"))
         return text
 
