@@ -2538,11 +2538,15 @@ def _process_turn_opencode(oc_agent: "OpenCodeAgent", chat: "Chat", user_input: 
     try:
         for event in oc_agent.run(prompt, session_id=oc_agent._session_id):
             if isinstance(event, Text):
-                answer_parts.append(event.content)
+                # opencode prefixes responses with \n\n — strip on first chunk
+                content = event.content.lstrip("\n") if not live_on else event.content
+                if not content:
+                    continue
+                answer_parts.append(content)
                 if not live_on:
                     live.start()
                     live_on = True
-                live.append(event.content)
+                live.append(content)
 
             elif isinstance(event, ToolCall):
                 if live_on:
@@ -2566,6 +2570,9 @@ def _process_turn_opencode(oc_agent: "OpenCodeAgent", chat: "Chat", user_input: 
                     live_on = False
 
             elif isinstance(event, AgentResult):
+                if live_on:
+                    live.stop()
+                    live_on = False
                 meta = event.meta or {}
                 sid = meta.get("session_id", "")
                 if sid:
