@@ -39,6 +39,10 @@ _TH  = "\033[38;2;130;190;255m"       # header text
 _THB = "\033[48;2;20;35;55m"          # header bg
 _TA  = "\033[48;2;18;18;26m"          # alt row bg
 
+_USD_TO_INR = 92.60
+_work_dir = "."
+_python_env = sys.executable
+
 
 def _strip_ansi(s: str) -> str:
     return _re.sub(r'\033\[[0-9;]*m', '', s)
@@ -248,11 +252,6 @@ def _print_markdown(text: str):
 
     print("\n".join(out))
 
-# ─────────────────────────────────────────────────────────────────────────────
-
-_USD_TO_INR = 92.60
-_work_dir = "."
-_python_env = sys.executable
 
 
 # ── Copilot models ────────────────────────────────────────────────────────────
