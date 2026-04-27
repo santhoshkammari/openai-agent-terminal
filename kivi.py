@@ -9,23 +9,205 @@ import os, sys, json, subprocess, threading, time, itertools
 from pathlib import Path
 from typing import Literal, Union
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import History
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.styles import Style
-from prompt_toolkit.completion import WordCompleter
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+import readline, tty, termios, fcntl
+import re as _re
 
-from rich.console import Console
-from rich.markdown import Markdown as RichMarkdown
-from rich.live import Live
-from rich.tree import Tree
-from rich.text import Text as RichText
-from rich.spinner import Spinner
+# ── Pure-ANSI markdown renderer ───────────────────────────────────────────────
+_RST  = "\033[0m"
+_BOLD = "\033[1m"
+_DIM  = "\033[2m"
+_ITAL = "\033[3m"
+_UL   = "\033[4m"
+_STRIKE = "\033[9m"
+_H1   = "\033[38;2;130;190;255m"
+_H2   = "\033[38;2;100;220;180m"
+_H3   = "\033[38;2;200;200;100m"
+_H4   = "\033[38;2;220;180;100m"
+_CODE = "\033[38;2;180;140;255m"
+_CBKG = "\033[48;2;22;22;30m"
+_BULL = "\033[38;2;255;160;80m"
+_NUM  = "\033[38;2;255;200;80m"
+_BORD = "\033[38;2;70;70;70m"
+_LINK = "\033[38;2;80;180;255m"
+_LINK_URL = "\033[38;2;80;80;120m"
+_QUOTE_BAR = "\033[38;2;80;120;80m"
+_QUOTE_TXT = "\033[38;2;160;200;160m"
+# table
+_TB  = "\033[38;2;60;100;140m"        # border
+_TH  = "\033[38;2;130;190;255m"       # header text
+_THB = "\033[48;2;20;35;55m"          # header bg
+_TA  = "\033[48;2;18;18;26m"          # alt row bg
 
 
+def _strip_ansi(s: str) -> str:
+    return _re.sub(r'\033\[[0-9;]*m', '', s)
 
-_rich = Console()
+
+def _inline(text: str) -> str:
+    # order matters: bold before italic, code first (no nesting inside code)
+    # inline code
+    text = _re.sub(r'`([^`]+)`', lambda m: f"{_CBKG}{_CODE} {m.group(1)} {_RST}", text)
+    # strikethrough ~~text~~
+    text = _re.sub(r'~~(.+?)~~', lambda m: f"{_STRIKE}{m.group(1)}{_RST}", text)
+    # bold+italic ***
+    text = _re.sub(r'\*\*\*(.+?)\*\*\*', lambda m: f"{_BOLD}{_ITAL}{m.group(1)}{_RST}", text)
+    # bold **text** or __text__
+    text = _re.sub(r'\*\*(.+?)\*\*|__(.+?)__', lambda m: f"{_BOLD}{m.group(1) or m.group(2)}{_RST}", text)
+    # italic *text* or _text_
+    text = _re.sub(r'\*(.+?)\*|(?<!\w)_(.+?)_(?!\w)', lambda m: f"{_ITAL}{m.group(1) or m.group(2)}{_RST}", text)
+    # links [text](url)
+    text = _re.sub(r'\[([^\]]+)\]\(([^)]+)\)', lambda m: f"{_LINK}{m.group(1)}{_RST} {_LINK_URL}({m.group(2)}){_RST}", text)
+    # bare URLs
+    text = _re.sub(r'(?<!\()https?://\S+', lambda m: f"{_LINK}{m.group(0)}{_RST}", text)
+    return text
+
+
+def _parse_row(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _is_sep(row: list[str]) -> bool:
+    return bool(row) and all(_re.match(r'^:?-{1,}:?$', c) for c in row if c)
+
+
+def _render_table(all_lines: list[str]) -> list[str]:
+    parsed = [_parse_row(l) for l in all_lines]
+    # find separator row
+    sep_idx = next((i for i, r in enumerate(parsed) if _is_sep(r)), 1)
+    headers = parsed[0] if parsed else []
+    rows    = [r for i, r in enumerate(parsed) if i != 0 and i != sep_idx]
+    ncols   = max(len(headers), max((len(r) for r in rows), default=0))
+    # pad all rows to ncols
+    while len(headers) < ncols: headers.append("")
+    rows = [r + [""] * (ncols - len(r)) for r in rows]
+
+    # column widths = max of header + all cells (raw text, no ANSI)
+    widths = [len(headers[c]) for c in range(ncols)]
+    for row in rows:
+        for c in range(ncols):
+            widths[c] = max(widths[c], len(row[c]))
+
+    def hline(l, m, r, f="─"):
+        return f"{_TB}{l}{(f'{m}').join(f * (w + 2) for w in widths)}{r}{_RST}"
+
+    def fmt_row(cells, header=False, bg=""):
+        parts = []
+        for c, w in enumerate(widths):
+            raw  = cells[c] if c < len(cells) else ""
+            pad  = w - len(raw)        # padding based on raw length before ANSI
+            styled = _inline(raw)
+            if header:
+                parts.append(f" {_THB}{_TH}{_BOLD}{styled}{_RST}{_THB}{' ' * pad} {_RST}")
+            else:
+                parts.append(f"{bg} {styled}{' ' * pad} {_RST}")
+        return f"{_TB}│{_RST}" + f"{_TB}│{_RST}".join(parts) + f"{_TB}│{_RST}"
+
+    out = [hline("╭", "┬", "╮")]
+    out.append(fmt_row(headers, header=True))
+    out.append(hline("├", "┼", "┤"))
+    for i, row in enumerate(rows):
+        out.append(fmt_row(row, bg=_TA if i % 2 == 0 else ""))
+    out.append(hline("╰", "┴", "╯"))
+    return out
+
+
+def _print_markdown(text: str):
+    lines  = text.split("\n")
+    out    = []
+    i      = 0
+    in_code = False
+    code_lang = ""
+
+    while i < len(lines):
+        line = lines[i]
+
+        # ── fenced code block ────────────────────────────────────────────────
+        if line.startswith("```"):
+            if not in_code:
+                in_code   = True
+                code_lang = line[3:].strip()
+                label     = f" {code_lang}" if code_lang else ""
+                try: tw = os.get_terminal_size().columns - 4
+                except: tw = 76
+                out.append(f"{_CBKG}{_BORD}  ┌{'─' * tw}┐{_RST}")
+                if code_lang:
+                    out.append(f"{_CBKG}{_DIM}  │ {code_lang:<{tw-2}}│{_RST}")
+                    out.append(f"{_CBKG}{_BORD}  ├{'─' * tw}┤{_RST}")
+            else:
+                try: tw = os.get_terminal_size().columns - 4
+                except: tw = 76
+                out.append(f"{_CBKG}{_BORD}  └{'─' * tw}┘{_RST}")
+                in_code = False
+            i += 1; continue
+
+        if in_code:
+            out.append(f"{_CBKG}{_CODE}  │ {line}{_RST}")
+            i += 1; continue
+
+        # ── headings ─────────────────────────────────────────────────────────
+        if line.startswith("#### "):
+            out.append(f"{_H4}{_BOLD}{line[5:]}{_RST}"); i += 1; continue
+        if line.startswith("### "):
+            out.append(f"\n{_H3}{_BOLD}{line[4:]}{_RST}"); i += 1; continue
+        if line.startswith("## "):
+            out.append(f"\n{_H2}{_BOLD}{line[3:]}{_RST}\n"); i += 1; continue
+        if line.startswith("# "):
+            try: tw = os.get_terminal_size().columns
+            except: tw = 80
+            title = line[2:]
+            out.append(f"\n{_H1}{_BOLD}{_UL}{title}{_RST}")
+            out.append(f"{_H1}{'─' * min(len(title), tw)}{_RST}\n")
+            i += 1; continue
+
+        # ── horizontal rule ──────────────────────────────────────────────────
+        if _re.match(r'^\s*[-*_]{3,}\s*$', line) and not line.strip().startswith("*") or _re.match(r'^\s*---+\s*$', line):
+            try: tw = os.get_terminal_size().columns
+            except: tw = 80
+            out.append(f"{_BORD}{'─' * tw}{_RST}"); i += 1; continue
+
+        # ── table: collect consecutive pipe-containing lines ─────────────────
+        if "|" in line:
+            tbl = []
+            while i < len(lines) and "|" in lines[i]:
+                tbl.append(lines[i]); i += 1
+            if len(tbl) >= 2:
+                out.extend(_render_table(tbl))
+            else:
+                out.append(_inline(tbl[0]))
+            continue
+
+        # ── blockquote ───────────────────────────────────────────────────────
+        if line.startswith(">"):
+            inner = line[1:].lstrip()
+            out.append(f"{_QUOTE_BAR}▌{_RST} {_QUOTE_TXT}{_inline(inner)}{_RST}")
+            i += 1; continue
+
+        # ── bullets ──────────────────────────────────────────────────────────
+        m = _re.match(r'^(\s*)([-*+]) (.*)', line)
+        if m:
+            depth  = len(m.group(1)) // 2
+            glyphs = ["•", "◦", "▸", "▹"]
+            glyph  = glyphs[min(depth, len(glyphs)-1)]
+            indent = "  " * depth
+            out.append(f"{indent}{_BULL}{glyph}{_RST} {_inline(m.group(3))}")
+            i += 1; continue
+
+        # ── numbered list ────────────────────────────────────────────────────
+        m = _re.match(r'^(\s*)(\d+)\. (.*)', line)
+        if m:
+            indent = m.group(1)
+            num    = m.group(2)
+            out.append(f"{indent}{_NUM}{num}.{_RST} {_inline(m.group(3))}")
+            i += 1; continue
+
+        # ── normal line ──────────────────────────────────────────────────────
+        out.append(_inline(line))
+        i += 1
+
+    print("\n".join(out))
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 _USD_TO_INR = 92.60
 _work_dir = "."
 _python_env = sys.executable
@@ -1871,80 +2053,92 @@ def expand_thinking(text: str):
 
 
 class ParallelToolDisplay:
-    def __init__(self, tool_calls: list):
-        self._tools = tool_calls
-        self._statuses: dict[str, str] = {tc.id: "running" for tc in tool_calls}
-        self._results: dict[str, str] = {}
-        self._lock = threading.Lock()
-        self._live = (
-            Live(console=_rich, refresh_per_second=12, transient=False)
-            if sys.stdout.isatty()
-            else None
-        )
+    _frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
 
-    def _build_tree(self):
-        total = len(self._tools)
-        done = sum(1 for s in self._statuses.values() if s == "done")
-        if done == total:
-            header = RichText(
-                f"⚡ {total} tool{'s' if total > 1 else ''} — all done",
-                style="bold green",
-            )
-        elif done:
-            header = RichText(
-                f"⚡ {total} tool{'s' if total > 1 else ''} in parallel  ✓{done}  ⠼{total - done} running",
-                style="bold yellow",
-            )
-        else:
-            header = RichText(
-                f"⚡ {total} tool{'s' if total > 1 else ''} in parallel",
-                style="bold yellow",
-            )
-        tree = Tree(header)
-        for tc in self._tools:
-            label = f"[bold yellow]{tc.name}[/bold yellow]{_fmt_args(tc.name, tc.arguments)}"
-            if self._statuses[tc.id] == "done":
-                res = self._results.get(tc.id, "")
-                preview = res[:100].replace("\n", " ")
-                ellip = "…" if len(res) > 100 else ""
-                node = tree.add(f"[green]✓[/green] {label}")
-                node.add(f"[dim]→ {preview}{ellip}[/dim]")
+    def __init__(self, tool_calls: list):
+        self._tools    = tool_calls
+        self._statuses: dict[str, str] = {tc.id: "running" for tc in tool_calls}
+        self._results:  dict[str, str] = {}
+        self._lock     = threading.Lock()
+        self._stop_ev  = threading.Event()
+        self._thread   = None
+        self._nlines   = 0   # lines currently drawn
+
+    def _render(self, frame: str) -> str:
+        YEL  = "\033[33m"
+        GRN  = "\033[32m"
+        RST  = "\033[0m"
+        DIM_ = "\033[2m"
+        with self._lock:
+            total = len(self._tools)
+            done  = sum(1 for s in self._statuses.values() if s == "done")
+            if done == total:
+                header = f"{GRN}⚡ {total} tool{'s' if total>1 else ''} — all done{RST}"
+            elif done:
+                header = f"{YEL}⚡ {total} tool{'s' if total>1 else ''} in parallel  ✓{done}  {frame}{total-done} running{RST}"
             else:
-                spinner = Spinner("dots", text=label, style="dim")
-                tree.add(spinner)
-        return tree
+                header = f"{YEL}⚡ {total} tool{'s' if total>1 else ''} in parallel  {frame}{RST}"
+            rows = [header]
+            for tc in self._tools:
+                args_hint = _fmt_args(tc.name, tc.arguments)
+                if self._statuses[tc.id] == "done":
+                    res     = self._results.get(tc.id, "")
+                    preview = res[:80].replace("\n", " ")
+                    ellip   = "…" if len(res) > 80 else ""
+                    rows.append(f"  {GRN}✓{RST} {YEL}{tc.name}{RST}{args_hint}")
+                    rows.append(f"    {DIM_}→ {preview}{ellip}{RST}")
+                else:
+                    rows.append(f"  {DIM_}{frame} {tc.name}{args_hint}{RST}")
+        return "\n".join(rows)
+
+    def _erase(self):
+        if self._nlines:
+            # move up and erase each line
+            sys.stdout.write(f"\033[{self._nlines}A")
+            sys.stdout.write("\033[J")
+            sys.stdout.flush()
+            self._nlines = 0
+
+    def _paint(self, frame: str):
+        text = self._render(frame)
+        lines = text.count("\n") + 1
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+        self._nlines = lines
 
     def start(self):
-        if self._live:
-            self._live.start()
-            self._live.update(self._build_tree())
-        else:
+        if not sys.stdout.isatty():
             print(f"{DIM}[tools running...]{RESET}", flush=True)
+            return
+        self._stop_ev.clear()
+        self._paint(self._frames[0])
+        def _loop():
+            for f in itertools.cycle(self._frames):
+                if self._stop_ev.is_set():
+                    break
+                self._erase()
+                self._paint(f)
+                time.sleep(0.08)
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
 
     def add_tool(self, tc):
         with self._lock:
             self._tools.append(tc)
             self._statuses[tc.id] = "running"
-        if self._live:
-            self._live.update(self._build_tree())
 
     def complete(self, tool_id: str, result: str):
         with self._lock:
             self._statuses[tool_id] = "done"
             self._results[tool_id] = result
-            if tool_id not in self._statuses:
-                for tc in self._tools:
-                    if self._statuses.get(tc.id) == "running":
-                        self._statuses[tc.id] = "done"
-                        self._results[tc.id] = result
-                        break
-        if self._live:
-            self._live.update(self._build_tree())
 
     def stop(self):
-        if self._live:
-            self._live.update(self._build_tree())
-            self._live.stop()
+        self._stop_ev.set()
+        if self._thread:
+            self._thread.join()
+        if sys.stdout.isatty():
+            self._erase()
+            self._paint("✓")
         for tc in self._tools:
             if tc.name == "edit":
                 result = self._results.get(tc.id, "")
@@ -1977,18 +2171,18 @@ class StreamText:
         text = "".join(self._buf)
         if text:
             if sys.stdout.isatty():
-                width = os.get_terminal_size().columns
+                try:
+                    width = os.get_terminal_size().columns
+                except OSError:
+                    width = 80
                 rows = 0
                 for line in text.splitlines(keepends=True):
                     rows += max(1, (len(line.rstrip("\n")) + width - 1) // width)
-                move_up = max(0, rows - 1)
-                if move_up:
-                    sys.stdout.write(f"\033[{move_up}A")
-                sys.stdout.write("\r\033[J")
+                # cursor is one line below the last printed line
+                sys.stdout.write(f"\033[{rows}A\r\033[J")
                 sys.stdout.flush()
-                _rich.print(RichMarkdown(text))
+                _print_markdown(text)
             else:
-                # no TTY (subprocess) — already printed plain, just add newline
                 print()
         return text
 
@@ -2626,90 +2820,277 @@ def _show_insights():
         print()
 
 
-# ── prompt_toolkit session ────────────────────────────────────────────
-_pt_style = Style.from_dict({"prompt": "bold", "bottom-toolbar": "bg:#1a1a1a #888888"})
+# ── Pure-Python prompt replacement ───────────────────────────────────────────
 _SLASH_COMMANDS = [
-    "/help",
-    "/modes",
-    "/mode",
-    "/clear",
-    "/history",
-    "/cwd",
-    "/think",
-    "/sessions",
-    "/claude",
-    "/kivi",
-    "/opencode",
-    "/copilot",
-    "/model",
-    "/usage",
-    "/limits",
-    "/insights",
-    "/quit",
+    "/help", "/modes", "/mode", "/clear", "/history", "/cwd", "/think",
+    "/sessions", "/claude", "/kivi", "/opencode", "/copilot", "/model",
+    "/usage", "/limits", "/insights", "/quit",
 ]
 
 
-class SQLiteChatHistory(History):
-    """prompt_toolkit History backed by the prompt_history SQLite table.
+class PromptToolKit:
+    """Raw-terminal prompt: history (↑/↓), tab dropdown, Shift+Tab mode toggle, ANSI color."""
 
-    Keyed by cwd only — so ↑/↓ recall works across all sessions in the same
-    directory. session_id is stored per-entry for auditing but not used for
-    lookup (a new session_id is minted every fresh terminal, so filtering by it
-    would always return empty on first launch).
+    RST  = "\033[0m"
+    BOLD = "\033[1m"
+    GREY = "\033[90m"
+    DIM2 = "\033[2m"
+    # cursor / erase
+    _EL  = "\033[2K"   # erase line
+    _CR  = "\r"
 
-    Contract: implement only load_history_strings() + store_string().
-    The base History.load() async generator handles all buffer management:
-      - calls load_history_strings() on first ↑ press
-      - stores results in self._loaded_strings (newest-first)
-      - sets self._loaded = True to prevent re-loading
-    Never touch _loaded_strings or _loaded manually.
-    """
+    def __init__(self, session_id: str, work_dir: str, repl_mode_container: list):
+        self._sid  = session_id
+        self._cwd  = work_dir
+        self._mode = repl_mode_container
+        self._completions = _SLASH_COMMANDS + [f"/mode {m}" for m in modes]
+        self._history: list[str] = load_prompt_inputs(cwd=work_dir)
 
-    def __init__(self, session_id: str, cwd: str):
-        super().__init__()  # sets _loaded=False, _loaded_strings=[]
-        self._session_id = session_id
-        self._cwd = cwd
+    # ── ANSI helpers ──────────────────────────────────────────────────────────
 
-    def load_history_strings(self):
-        """Yield stored inputs newest-first, scoped to cwd across all sessions."""
-        yield from reversed(load_prompt_inputs(cwd=self._cwd))
+    @staticmethod
+    def _hex_fg(h: str) -> str:
+        r, g, b = int(h[1:3],16), int(h[3:5],16), int(h[5:7],16)
+        return f"\033[38;2;{r};{g};{b}m"
 
-    def store_string(self, string: str):
-        """Persist each submitted input; called by append_string() in the base class."""
-        save_prompt_input(self._session_id, self._cwd, string)
+    def _render_prompt(self, agent: str, color: str) -> str:
+        if self._mode[0] == "plan":
+            label = f"{agent}{self.GREY}_plan{self.RST}{color}"
+        else:
+            label = agent
+        return f"{self.BOLD}{color}{label}> {self.RST}"
+
+    def _redraw(self, prompt_str: str, buf: str, cur: int):
+        """Rewrite the current line: prompt + buffer, place cursor at cur."""
+        sys.stdout.write(f"{self._CR}{self._EL}{prompt_str}{buf}")
+        # move cursor back if needed
+        if cur < len(buf):
+            sys.stdout.write(f"\033[{len(buf)-cur}D")
+        sys.stdout.flush()
+
+    def _show_dropdown(self, prompt_str: str, buf: str, matches: list[str], active: int = 0):
+        col     = self._hex_fg("#4a9eff")
+        hi_bg   = "\033[48;2;40;40;60m"   # subtle highlight bg for active row
+        out = ""
+        for i, m in enumerate(matches[:12]):
+            if i == active:
+                out += f"\r\n  {hi_bg}{col}▸ {m}{self.RST}"
+            else:
+                out += f"\r\n  {col}  {m}{self.RST}"
+        rows = min(len(matches), 12)
+        out += f"\033[{rows}A"
+        sys.stdout.write(out)
+        sys.stdout.flush()
+
+    def _clear_dropdown(self, rows: int):
+        if rows == 0:
+            return
+        sys.stdout.write("\033[s")  # save cursor
+        for _ in range(rows):
+            sys.stdout.write(f"\r\n{self._EL}")
+        sys.stdout.write("\033[u")  # restore cursor
+        sys.stdout.flush()
+
+    # ── raw key reader ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _read_key(fd: int) -> str:
+        ch = os.read(fd, 1).decode("utf-8", errors="replace")
+        if ch == "\x1b":
+            # read up to 5 more bytes non-blocking
+            old_fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_fl | os.O_NONBLOCK)
+            try:
+                rest = b""
+                for _ in range(5):
+                    try:
+                        rest += os.read(fd, 1)
+                    except BlockingIOError:
+                        break
+            finally:
+                fcntl.fcntl(fd, fcntl.F_SETFL, old_fl)
+            seq = rest.decode("utf-8", errors="replace")
+            return "\x1b" + seq
+        return ch
+
+    # ── main prompt loop ──────────────────────────────────────────────────────
+
+    def prompt(self, agent: str = "kivi", ac_hex: str = "#D97757") -> str:
+        color      = self._hex_fg(ac_hex)
+        prompt_str = self._render_prompt(agent, color)
+        buf        = []   # list of chars
+        cur        = 0    # cursor position in buf
+        hist_pos   = len(self._history)
+        saved_buf  = []   # saved draft while browsing history
+        dd_rows    = 0    # dropdown rows currently shown
+        tab_matches: list[str] = []
+        tab_idx    = 0
+
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd)
+        sys.stdout.write(prompt_str)
+        sys.stdout.flush()
+
+        try:
+            while True:
+                key = self._read_key(fd)
+
+                # ── Enter ────────────────────────────────────────────────────
+                if key in ("\r", "\n"):
+                    self._clear_dropdown(dd_rows)
+                    dd_rows = 0
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    text = "".join(buf).strip()
+                    if text:
+                        self._history.append(text)
+                        save_prompt_input(self._sid, self._cwd, text)
+                    return text
+
+                # ── Ctrl-C ───────────────────────────────────────────────────
+                elif key == "\x03":
+                    self._clear_dropdown(dd_rows)
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    raise KeyboardInterrupt
+
+                # ── Ctrl-D ───────────────────────────────────────────────────
+                elif key == "\x04":
+                    self._clear_dropdown(dd_rows)
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    raise EOFError
+
+                # ── Backspace ────────────────────────────────────────────────
+                elif key in ("\x7f", "\x08"):
+                    self._clear_dropdown(dd_rows); dd_rows = 0
+                    tab_matches = []
+                    if cur > 0:
+                        buf.pop(cur - 1)
+                        cur -= 1
+                    self._redraw(prompt_str, "".join(buf), cur)
+
+                # ── Shift+Tab  ESC [ Z ───────────────────────────────────────
+                elif key == "\x1b[Z":
+                    self._clear_dropdown(dd_rows); dd_rows = 0
+                    self._mode[0] = "plan" if self._mode[0] == "build" else "build"
+                    prompt_str = self._render_prompt(agent, color)
+                    self._redraw(prompt_str, "".join(buf), cur)
+
+                # ── Tab ──────────────────────────────────────────────────────
+                elif key == "\t":
+                    if dd_rows and tab_matches:
+                        # dropdown open — cycle down
+                        tab_idx = (tab_idx + 1) % len(tab_matches)
+                        buf = list(tab_matches[tab_idx]); cur = len(buf)
+                        self._clear_dropdown(dd_rows)
+                        dd_rows = min(len(tab_matches), 12)
+                        self._redraw(prompt_str, "".join(buf), cur)
+                        self._show_dropdown(prompt_str, "".join(buf), tab_matches, tab_idx)
+                    else:
+                        line = "".join(buf)
+                        tab_matches = [c for c in self._completions if c.startswith(line)]
+                        if tab_matches:
+                            tab_idx = 0
+                            buf = list(tab_matches[0]); cur = len(buf)
+                            dd_rows = min(len(tab_matches), 12)
+                            self._redraw(prompt_str, "".join(buf), cur)
+                            self._show_dropdown(prompt_str, "".join(buf), tab_matches, tab_idx)
+
+                # ── Arrow Up ─────────────────────────────────────────────────
+                elif key == "\x1b[A":
+                    if dd_rows and tab_matches:
+                        # navigate dropdown up
+                        tab_idx = (tab_idx - 1) % len(tab_matches)
+                        buf = list(tab_matches[tab_idx]); cur = len(buf)
+                        self._clear_dropdown(dd_rows)
+                        dd_rows = min(len(tab_matches), 12)
+                        self._redraw(prompt_str, "".join(buf), cur)
+                        self._show_dropdown(prompt_str, "".join(buf), tab_matches, tab_idx)
+                    else:
+                        if hist_pos == len(self._history):
+                            saved_buf = buf[:]
+                        if hist_pos > 0:
+                            hist_pos -= 1
+                            buf = list(self._history[hist_pos]); cur = len(buf)
+                        self._redraw(prompt_str, "".join(buf), cur)
+
+                # ── Arrow Down ───────────────────────────────────────────────
+                elif key == "\x1b[B":
+                    if dd_rows and tab_matches:
+                        # navigate dropdown down
+                        tab_idx = (tab_idx + 1) % len(tab_matches)
+                        buf = list(tab_matches[tab_idx]); cur = len(buf)
+                        self._clear_dropdown(dd_rows)
+                        dd_rows = min(len(tab_matches), 12)
+                        self._redraw(prompt_str, "".join(buf), cur)
+                        self._show_dropdown(prompt_str, "".join(buf), tab_matches, tab_idx)
+                    else:
+                        if hist_pos < len(self._history) - 1:
+                            hist_pos += 1
+                            buf = list(self._history[hist_pos]); cur = len(buf)
+                        elif hist_pos == len(self._history) - 1:
+                            hist_pos = len(self._history)
+                            buf = saved_buf[:]; cur = len(buf)
+                        self._redraw(prompt_str, "".join(buf), cur)
+
+                # ── Arrow Left ───────────────────────────────────────────────
+                elif key == "\x1b[D":
+                    if cur > 0:
+                        cur -= 1
+                        sys.stdout.write("\033[D")
+                        sys.stdout.flush()
+
+                # ── Arrow Right ──────────────────────────────────────────────
+                elif key == "\x1b[C":
+                    if cur < len(buf):
+                        cur += 1
+                        sys.stdout.write("\033[C")
+                        sys.stdout.flush()
+
+                # ── Home / End ───────────────────────────────────────────────
+                elif key in ("\x1b[H", "\x01"):   # Home or Ctrl-A
+                    cur = 0
+                    self._redraw(prompt_str, "".join(buf), cur)
+                elif key in ("\x1b[F", "\x05"):   # End or Ctrl-E
+                    cur = len(buf)
+                    self._redraw(prompt_str, "".join(buf), cur)
+
+                # ── Delete ───────────────────────────────────────────────────
+                elif key == "\x1b[3~":
+                    self._clear_dropdown(dd_rows); dd_rows = 0
+                    if cur < len(buf):
+                        buf.pop(cur)
+                    self._redraw(prompt_str, "".join(buf), cur)
+
+                # ── Printable chars ──────────────────────────────────────────
+                elif len(key) == 1 and key >= " ":
+                    self._clear_dropdown(dd_rows); dd_rows = 0
+                    tab_matches = []
+                    buf.insert(cur, key)
+                    cur += 1
+                    self._redraw(prompt_str, "".join(buf), cur)
+                    # auto-open dropdown when line starts with /
+                    if "".join(buf).startswith("/"):
+                        line = "".join(buf)
+                        tab_matches = [c for c in self._completions if c.startswith(line)]
+                        if tab_matches:
+                            tab_idx = 0
+                            dd_rows = min(len(tab_matches), 12)
+                            self._show_dropdown(prompt_str, "".join(buf), tab_matches, tab_idx)
+
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def make_session(
-    session_id: str, work_dir: str, key_bindings=None, bottom_toolbar=None
-) -> PromptSession:
-    return PromptSession(
-        history=SQLiteChatHistory(session_id, work_dir),
-        style=_pt_style,
-        completer=WordCompleter(
-            _SLASH_COMMANDS + [f"/mode {m}" for m in modes], sentence=True, pattern=None
-        ),
-        complete_while_typing=True,
-        auto_suggest=AutoSuggestFromHistory(),
-        key_bindings=key_bindings,
-        bottom_toolbar=bottom_toolbar,
-    )
+def make_session(session_id: str, work_dir: str, repl_mode_container: list = None) -> PromptToolKit:
+    return PromptToolKit(session_id, work_dir, repl_mode_container or ["build"])
 
 
 def _make_keybindings(repl_mode_container):
-    """Create prompt_toolkit keybindings for plan/build mode toggle."""
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.keys import Keys
-
-    kb = KeyBindings()
-
-    @kb.add(Keys.BackTab)
-    def _(event):
-        repl_mode_container[0] = (
-            "plan" if repl_mode_container[0] == "build" else "build"
-        )
-        event.app.invalidate()
-
-    return kb
+    # No-op: Shift+Tab is handled inline in the REPL loop via _handle_shift_tab
+    return repl_mode_container
 
 
 # ── @ directive expansion ─────────────────────────────────────────────────────
@@ -2848,7 +3229,7 @@ def _render_history(history: list):
                 if non_system[j].get("role") == "assistant":
                     ac = non_system[j].get("content") or ""
                     if isinstance(ac, str) and ac.strip():
-                        _rich.print(RichMarkdown(ac.strip()))
+                        _print_markdown(ac.strip())
                 j += 1
             i = j
         else:
@@ -2885,8 +3266,8 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
     if session_id is None:
         session_id = new_session_id()
     resumed = initial_history is not None
-    keybindings = _make_keybindings(repl_mode_container)
-    session = make_session(session_id, work_dir, key_bindings=keybindings)
+    _make_keybindings(repl_mode_container)
+    session = make_session(session_id, work_dir, repl_mode_container)
 
     ac = AGENT_COLOR.get(current_agent, CORAL)
     print(f"""           kivi v1.0 · AI Agent
@@ -2907,18 +3288,8 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
     while True:
         ac_hex = _AGENT_HEX.get(current_agent, "#D97757")
 
-        def _prompt_msg():
-            suffix = (
-                "<style fg='#888888'>_plan</style>"
-                if repl_mode_container[0] == "plan"
-                else ""
-            )
-            return HTML(
-                f"<bold><style fg='{ac_hex}'>{current_agent}{suffix}></style> </bold>"
-            )
-
         try:
-            user_input = session.prompt(_prompt_msg).strip()
+            user_input = session.prompt(current_agent, ac_hex).strip()
         except KeyboardInterrupt:
             # Ctrl+C clears current input, stay in loop
             print()
@@ -3056,7 +3427,7 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
                     {"role": "system", "content": _build_system_prompt(all_tools)}
                 )
                 agent = AIAgent(config=AIConfig(base_url=base_url), tools=all_tools)
-                session = make_session(session_id, work_dir, key_bindings=keybindings)
+                session = make_session(session_id, work_dir, repl_mode_container)
                 print(f"{DIM}cleared — new session {session_id}{RESET}")
                 # Reset to build mode on clear
                 repl_mode_container[0] = "build"
