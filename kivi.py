@@ -371,17 +371,21 @@ COPILOT_MODELS = {
 }
 
 # ── Plan/Build mode toggle ───────────────────────────────────────────────────
-PLANNER_SYSTEM_PROMPT = """
-You are in PLAN MODE. Your task is to create a detailed execution plan for the user's request.
-DO NOT execute any tools. Only output a structured plan describing what steps should be taken.
-Your plan should include:
-- What files need to be read or modified
-- What commands need to be run
-- What tools need to be called
+PLANNER_SYSTEM_PROMPT_PREFIX = """You are Kivi Agent in PLAN MODE.
+Your task is to create a detailed, step-by-step execution plan for the user's request.
+You have READ-ONLY access to the filesystem (read, glob, grep) to inspect the codebase.
+DO NOT call write, edit, or bash tools — only read, glob, and grep are available.
+Your plan output must include:
+- Which files need to be read or modified and why
+- Exact edits or shell commands that would be run in build mode
 - The expected outcome of each step
+- Any risks or edge cases to watch for
 
-Once you've created the plan, ask the user if they want to proceed with execution.
+After presenting the plan, ask the user if they want to switch to build mode to execute it.
 """
+
+# Tools allowed in plan mode (read-only inspection only)
+_PLAN_MODE_ALLOWED = {"read", "glob", "grep"}
 _copilot_model: str | None = None  # None = copilot default
 
 
@@ -1292,7 +1296,10 @@ class AIAgent:
             def _exec_tool(tc: ToolCall):
                 fn = _fn_registry[tc.name]
                 args = json.loads(tc.arguments) if tc.arguments else {}
-                raw = fn(**args)
+                try:
+                    raw = fn(**args)
+                except Exception as exc:
+                    return f"[tool error: {exc}]"
                 if inspect.isgenerator(raw):
                     parts = []
                     for chunk in raw:
@@ -1312,7 +1319,6 @@ class AIAgent:
             elif tool_calls:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=len(tool_calls)) as pool:
                     futures = [pool.submit(_exec_tool, tc) for tc in tool_calls]
-                    # collect results in original call order so chat history stays consistent
                     results = [f.result() for f in futures]
                 for tc, result in zip(tool_calls, results):
                     chat._append_tool_result(tc, result)
@@ -2544,11 +2550,82 @@ def _process_turn(agent, chat, current_mode):
             live_on = False
         if display:
             display.stop()
-        print(f"\n{RED}[error] {e}{RESET}")
+
+        if not _is_context_limit_error(e):
+            print(f"\n{RED}[error] {e}{RESET}")
+        raise  # re-raise so _process_turn_with_autocompact can catch it
 
     if live_on:
         live.stop()
     return turn_thinking
+
+
+def _is_context_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "400" in msg and ("context length" in msg or "input tokens" in msg or "maximum" in msg)
+
+
+# Each entry is (keep_last_messages, max_content_chars_per_message)
+_COMPACT_SCHEDULE = [(10, 1200), (8, 800), (6, 500), (4, 300), (2, 200)]
+
+
+def _autocompact(chat: "Chat", level: int) -> bool:
+    """
+    Compact chat history at the given schedule level index.
+    Truncates content of ALL kept messages AND drops oldest messages.
+    Only inserts a stub if messages were actually dropped.
+    Returns True if anything changed, False if schedule exhausted.
+    """
+    if level >= len(_COMPACT_SCHEDULE):
+        return False
+
+    keep_last, content_limit = _COMPACT_SCHEDULE[level]
+    system_msgs = [m for m in chat._messages if m.get("role") == "system"]
+    non_system  = [m for m in chat._messages if m.get("role") != "system"]
+    dropped_count = max(0, len(non_system) - keep_last)
+
+    def _trunc(m):
+        content = m.get("content")
+        if isinstance(content, str) and len(content) > content_limit:
+            m = dict(m)
+            m["content"] = content[:content_limit] + f" …[+{len(content)-content_limit}c]"
+        return m
+
+    recent = [_trunc(m) for m in non_system[-keep_last:]]
+
+    if dropped_count > 0:
+        stub_user = {"role": "user",      "content": f"[{dropped_count} earlier messages dropped; keeping last {keep_last}]"}
+        stub_asst = {"role": "assistant", "content": "Understood, continuing from recent context."}
+        chat._messages = system_msgs + [stub_user, stub_asst] + recent
+    else:
+        # nothing dropped — only content was truncated
+        chat._messages = system_msgs + recent
+
+    print(
+        f"\033[2m[autocompact] level {level+1}/{len(_COMPACT_SCHEDULE)}: "
+        f"kept last {min(keep_last, len(non_system))} msgs"
+        + (f", dropped {dropped_count}" if dropped_count else "")
+        + f", content capped at {content_limit} chars\033[0m",
+        flush=True,
+    )
+    return True
+
+
+def _process_turn_with_autocompact(agent, chat, current_mode):
+    """Run _process_turn with automatic context-limit recovery. No recursion."""
+    for level in range(len(_COMPACT_SCHEDULE) + 1):
+        try:
+            return _process_turn(agent, chat, current_mode)
+        except Exception as e:
+            if not _is_context_limit_error(e):
+                print(f"\n\033[31m[error] {e}\033[0m")
+                return ""
+            # compact at this level, then retry
+            print(f"\033[2m[autocompact] context limit — trying level {level+1}/{len(_COMPACT_SCHEDULE)}…\033[0m", flush=True)
+            if not _autocompact(chat, level):
+                print(f"\033[31m[autocompact] schedule exhausted — cannot reduce further\033[0m")
+                return ""
+    return ""
 
 
 def _build_chat_context(chat: "Chat", max_messages: int = 10) -> str:
@@ -3480,23 +3557,30 @@ def _expand_at_directives(prompt: str, work_dir: str) -> str:
 # ── REPL ──────────────────────────────────────────────────────────────────────
 
 
-def _build_system_prompt(tools: list) -> str:
+def _build_system_prompt(tools: list, plan_mode: bool = False) -> str:
     """Build system prompt dynamically from the actual resolved tool schemas."""
     base_url = os.environ.get("OPENAI_BASE_URL", "http://192.168.170.76:8000/v1")
     agent = AIAgent(config=AIConfig(base_url=base_url), tools=tools)
     schemas = agent._resolve_tools(tools)
 
-    lines = [
-        "You are Kivi Agent, official CLI for Kivi model.",
-        "You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.",
-        "When multiple independent tasks can be done in parallel, call multiple tools at once — they run concurrently.",
-        "",
-        "## Tools",
-    ]
+    if plan_mode:
+        # In plan mode only advertise the read-only tools actually available
+        schemas = [s for s in schemas if s["function"]["name"] in _PLAN_MODE_ALLOWED]
+        header = [PLANNER_SYSTEM_PROMPT_PREFIX, "## Available tools (read-only)"]
+    else:
+        header = [
+            "You are Kivi Agent, official CLI for Kivi model.",
+            "You are an interactive agent that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.",
+            "When multiple independent tasks can be done in parallel, call multiple tools at once — they run concurrently.",
+            "",
+            "## Tools",
+        ]
+
+    lines = list(header)
     for s in schemas:
         fn = s["function"]
         name = fn["name"]
-        desc = (fn.get("description") or "").splitlines()[0]  # first line only
+        desc = (fn.get("description") or "").splitlines()[0]
         params = fn.get("parameters", {}).get("properties", {})
         required = fn.get("parameters", {}).get("required", [])
         param_parts = []
@@ -3512,11 +3596,29 @@ def _build_system_prompt(tools: list) -> str:
         lines.append(f"- **{name}**({sig}): {desc}")
         lines.extend(param_parts)
 
-    lines += [
-        "",
-        "Be concise and direct. Always use tools to act on files/shell instead of describing what to do.",
-    ]
+    if plan_mode:
+        lines += ["", "Present your plan clearly. Do NOT call write, edit, or bash."]
+    else:
+        lines += ["", "Be concise and direct. Always use tools to act on files/shell instead of describing what to do."]
     return "\n".join(lines)
+
+
+def _update_system_prompt(chat: "Chat", tools: list, plan_mode: bool = False):
+    """Update (or insert) the system message in chat to match the current mode."""
+    new_content = _build_system_prompt(tools, plan_mode=plan_mode)
+    for msg in chat._messages:
+        if msg.get("role") == "system":
+            msg["content"] = new_content
+            return
+    # no system message yet — prepend one
+    chat._messages.insert(0, {"role": "system", "content": new_content})
+
+
+def _tools_for_mode(all_tools: list, plan_mode: bool) -> list:
+    """Return the subset of tools appropriate for the current mode."""
+    if not plan_mode:
+        return all_tools
+    return [t for t in all_tools if getattr(t, "__name__", getattr(type(t), "__name__", "")).lower() in _PLAN_MODE_ALLOWED]
 
 
 def _render_history(history: list):
@@ -3559,13 +3661,14 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
     base_url = os.environ.get("OPENAI_BASE_URL", "http://192.168.170.76:8000/v1")
 
     chat = Chat()
-    # Use all tools in build mode, filter in plan mode
     all_tools = STATIC_TOOLS + [ClaudeTool(chat)]
     if initial_history:
         chat._messages = list(initial_history)
+        # ensure system prompt is present and up-to-date for build mode
+        _update_system_prompt(chat, all_tools, plan_mode=False)
     else:
         chat._messages.append(
-            {"role": "system", "content": _build_system_prompt(all_tools)}
+            {"role": "system", "content": _build_system_prompt(all_tools, plan_mode=False)}
         )
 
     agent = AIAgent(config=AIConfig(base_url=base_url), tools=all_tools)
@@ -3588,7 +3691,7 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
     print(f"""           kivi v1.0 · AI Agent
  ▐▛███▜▌   {_work_dir}
 ▝▜█████▛▘  {DIM}endpoint: {base_url}{RESET}
-  ▘▘ ▝▝    {DIM}{'resumed ' if resumed else ''}session {RESET}{CREAM}{session_id}{RESET}"{DIM}|{RESET}  mode: {CREAM}{current_mode}{RESET}"{DIM}|{RESET}  agent: {ac}{BOLD}{current_agent}{RESET}"{DIM}""" 
+  ▘▘ ▝▝    {DIM}{'resumed ' if resumed else ''}session {RESET}{CREAM}{session_id}{RESET}"{DIM}|{RESET}  mode: {CREAM}{current_mode}{RESET}{DIM}|{RESET}  agent: {ac}{BOLD}{current_agent}{RESET}{DIM}""" 
     )
     if resumed and initial_history:
         _render_history(initial_history)
@@ -3736,16 +3839,15 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
                         )
                     print()
             elif cmd == "/clear":
+                repl_mode_container[0] = "build"
                 chat = Chat()
                 all_tools = STATIC_TOOLS + [ClaudeTool(chat)]
                 chat._messages.append(
-                    {"role": "system", "content": _build_system_prompt(all_tools)}
+                    {"role": "system", "content": _build_system_prompt(all_tools, plan_mode=False)}
                 )
                 agent = AIAgent(config=AIConfig(base_url=base_url), tools=all_tools)
                 session = make_session(session_id, work_dir, repl_mode_container)
                 print(f"{DIM}cleared — new session {session_id}{RESET}")
-                # Reset to build mode on clear
-                repl_mode_container[0] = "build"
             elif cmd == "/history":
                 print(
                     f"{DIM}{sum(1 for m in chat.messages if m['role'] != 'system')} messages{RESET}"
@@ -3797,24 +3899,15 @@ def run_repl(work_dir: str, session_id: str = None, initial_history: list = None
         elif current_agent == "copilot":
             _process_turn_copilot(copilot_agent, chat, expanded_input)
         else:
-            if repl_mode_container[0] == "plan":
-                filtered_tools = [
-                    t for t in all_tools if getattr(t, "__name__", None) != "edit"
-                ]
-                agent_filtered = AIAgent(
-                    config=AIConfig(base_url=base_url), tools=filtered_tools
-                )
-                base_sys = _build_system_prompt(filtered_tools)
-                chat._messages[0]["content"] = PLANNER_SYSTEM_PROMPT + "\n\n" + base_sys
-                chat.add(expanded_input)
-                turn_thinking = _process_turn(agent_filtered, chat, current_mode)
-                if turn_thinking:
-                    last_thinking = turn_thinking
-            else:
-                chat.add(expanded_input)
-                turn_thinking = _process_turn(agent, chat, current_mode)
-                if turn_thinking:
-                    last_thinking = turn_thinking
+            is_plan = repl_mode_container[0] == "plan"
+            active_tools = _tools_for_mode(all_tools, is_plan)
+            _update_system_prompt(chat, all_tools, plan_mode=is_plan)
+            # rebuild agent only when tools actually differ (plan vs build)
+            active_agent = AIAgent(config=AIConfig(base_url=base_url), tools=active_tools) if is_plan else agent
+            chat.add(expanded_input)
+            turn_thinking = _process_turn_with_autocompact(active_agent, chat, current_mode)
+            if turn_thinking:
+                last_thinking = turn_thinking
 
         # auto-save after each turn
         history = [m for m in chat.messages if m["role"] != "system"]
