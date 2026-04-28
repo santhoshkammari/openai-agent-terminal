@@ -1163,7 +1163,7 @@ class AIAgent:
             for chunk in StreamManager.run(stream):
                 if isinstance(chunk, ToolCall):
                     tool_calls.append(chunk)
-                    chat.add(chunk)
+                    # don't add to chat yet — batch all tool calls into one assistant message below
                     yield chunk
                 elif isinstance(chunk, Assistant):
                     chat.add(chunk)
@@ -1173,6 +1173,24 @@ class AIAgent:
                     yield chunk
                 else:
                     yield chunk
+
+            # Emit all tool calls as a single assistant message so the history is valid
+            if tool_calls:
+                chat._messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                })
 
             def _exec_tool(tc: ToolCall):
                 fn = _fn_registry[tc.name]
@@ -1196,14 +1214,14 @@ class AIAgent:
                 yield tr
             elif tool_calls:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=len(tool_calls)) as pool:
-                    future_to_tc = {pool.submit(_exec_tool, tc): tc for tc in tool_calls}
-                    for future in concurrent.futures.as_completed(future_to_tc):
-                        tc = future_to_tc[future]
-                        result = future.result()
-                        chat._append_tool_result(tc, result)
-                        tr = ToolResult(name=tc.name, id=tc.id, arguments=tc.arguments, result=result)
-                        step_results.append(tr)
-                        yield tr
+                    futures = [pool.submit(_exec_tool, tc) for tc in tool_calls]
+                    # collect results in original call order so chat history stays consistent
+                    results = [f.result() for f in futures]
+                for tc, result in zip(tool_calls, results):
+                    chat._append_tool_result(tc, result)
+                    tr = ToolResult(name=tc.name, id=tc.id, arguments=tc.arguments, result=result)
+                    step_results.append(tr)
+                    yield tr
 
             total_tool_calls += len(tool_calls)
             stop_reason = "tool_use" if tool_calls else "end_turn"
