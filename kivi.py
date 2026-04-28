@@ -13,31 +13,52 @@ from typing import Literal, Union
 import readline, tty, termios, fcntl
 import re as _re
 
-# ── Pure-ANSI markdown renderer ───────────────────────────────────────────────
-_RST  = "\033[0m"
-_BOLD = "\033[1m"
-_DIM  = "\033[2m"
-_ITAL = "\033[3m"
-_UL   = "\033[4m"
+# ── Pure-ANSI markdown renderer ── Anthropic palette ─────────────────────────
+_RST    = "\033[0m"
+_BOLD   = "\033[1m"
+_DIM    = "\033[2m"
+_ITAL   = "\033[3m"
+_UL     = "\033[4m"
 _STRIKE = "\033[9m"
-_H1   = "\033[38;2;130;190;255m"
-_H2   = "\033[38;2;100;220;180m"
-_H3   = "\033[38;2;200;200;100m"
-_H4   = "\033[38;2;220;180;100m"
-_CODE = "\033[38;2;180;140;255m"
-_CBKG = "\033[48;2;22;22;30m"
-_BULL = "\033[38;2;255;160;80m"
-_NUM  = "\033[38;2;255;200;80m"
-_BORD = "\033[38;2;70;70;70m"
-_LINK = "\033[38;2;80;180;255m"
-_LINK_URL = "\033[38;2;80;80;120m"
-_QUOTE_BAR = "\033[38;2;80;120;80m"
-_QUOTE_TXT = "\033[38;2;160;200;160m"
+
+# Anthropic brand palette
+# coral/terracotta accent
+_CORAL   = "\033[38;2;218;119;86m"     # #DA7756
+_TERRA   = "\033[38;2;207;102;73m"     # #CF6649 deeper coral
+# warm neutral text
+_CREAM   = "\033[38;2;232;220;200m"    # #E8DCC8 warm cream
+_SAND    = "\033[38;2;180;160;130m"    # #B4A082 muted sand
+_DUST    = "\033[38;2;130;115;95m"     # #82735F dim dust
+# purple/violet accent (anthropic secondary)
+_VIOLET  = "\033[38;2;167;139;250m"    # #A78BFA soft violet
+_ORCHID  = "\033[38;2;196;162;255m"    # #C4A2FF light orchid
+# teal/sage accent
+_SAGE    = "\033[38;2;94;197;162m"     # #5EC5A2 sage teal
+_MINT    = "\033[38;2;134;218;185m"    # #86DAB9 light mint
+# backgrounds
+_BG_DEEP = "\033[48;2;18;16;14m"       # near-black warm
+_BG_CARD = "\033[48;2;26;22;18m"       # card bg warm dark
+_BG_ALT  = "\033[48;2;22;19;16m"       # subtle alt row
+
+# semantic assignments
+_H1        = _CORAL
+_H2        = _SAGE
+_H3        = _ORCHID
+_H4        = _SAND
+_CODE      = _VIOLET
+_CBKG      = _BG_CARD
+_BULL      = _CORAL
+_NUM       = _TERRA
+_BORD      = _DUST
+_LINK      = _MINT
+_LINK_URL  = _DUST
+_QUOTE_BAR = _TERRA
+_QUOTE_TXT = _SAND
 # table
-_TB  = "\033[38;2;60;100;140m"        # border
-_TH  = "\033[38;2;130;190;255m"       # header text
-_THB = "\033[48;2;20;35;55m"          # header bg
-_TA  = "\033[48;2;18;18;26m"          # alt row bg
+_TB  = _DUST                           # border — subtle, not loud
+_TH  = _CREAM                          # header text warm white
+_THB = "\033[48;2;45;30;20m"           # header bg warm dark brown
+_TA  = _BG_ALT                         # alt row bg
 
 _USD_TO_INR = 92.60
 _work_dir = "."
@@ -50,21 +71,24 @@ def _strip_ansi(s: str) -> str:
 
 
 def _inline(text: str) -> str:
-    # order matters: bold before italic, code first (no nesting inside code)
-    # inline code
-    text = _re.sub(r'`([^`]+)`', lambda m: f"{_CBKG}{_CODE} {m.group(1)} {_RST}", text)
-    # strikethrough ~~text~~
-    text = _re.sub(r'~~(.+?)~~', lambda m: f"{_STRIKE}{m.group(1)}{_RST}", text)
-    # bold+italic ***
-    text = _re.sub(r'\*\*\*(.+?)\*\*\*', lambda m: f"{_BOLD}{_ITAL}{m.group(1)}{_RST}", text)
-    # bold **text** or __text__
-    text = _re.sub(r'\*\*(.+?)\*\*|__(.+?)__', lambda m: f"{_BOLD}{m.group(1) or m.group(2)}{_RST}", text)
-    # italic *text* or _text_
-    text = _re.sub(r'\*(.+?)\*|(?<!\w)_(.+?)_(?!\w)', lambda m: f"{_ITAL}{m.group(1) or m.group(2)}{_RST}", text)
+    # inline code — violet on warm dark bg
+    text = _re.sub(r'`([^`]+)`',
+        lambda m: f"\033[48;2;35;26;45m{_VIOLET} {m.group(1)} {_RST}", text)
+    # strikethrough
+    text = _re.sub(r'~~(.+?)~~', lambda m: f"{_STRIKE}\033[38;2;100;85;70m{m.group(1)}{_RST}", text)
+    # bold+italic
+    text = _re.sub(r'\*\*\*(.+?)\*\*\*', lambda m: f"{_BOLD}{_ITAL}{_CREAM}{m.group(1)}{_RST}", text)
+    # bold — warm cream
+    text = _re.sub(r'\*\*(.+?)\*\*|__(.+?)__',
+        lambda m: f"{_BOLD}{_CREAM}{m.group(1) or m.group(2)}{_RST}", text)
+    # italic — soft sand
+    text = _re.sub(r'\*(.+?)\*|(?<!\w)_(.+?)_(?!\w)',
+        lambda m: f"{_ITAL}{_SAND}{m.group(1) or m.group(2)}{_RST}", text)
     # links [text](url)
-    text = _re.sub(r'\[([^\]]+)\]\(([^)]+)\)', lambda m: f"{_LINK}{m.group(1)}{_RST} {_LINK_URL}({m.group(2)}){_RST}", text)
+    text = _re.sub(r'\[([^\]]+)\]\(([^)]+)\)',
+        lambda m: f"{_MINT}{_UL}{m.group(1)}{_RST} {_DUST}↗ {m.group(2)}{_RST}", text)
     # bare URLs
-    text = _re.sub(r'(?<!\()https?://\S+', lambda m: f"{_LINK}{m.group(0)}{_RST}", text)
+    text = _re.sub(r'(?<!\()https?://\S+', lambda m: f"{_MINT}{m.group(0)}{_RST}", text)
     return text
 
 
@@ -95,23 +119,23 @@ def _render_table(all_lines: list[str]) -> list[str]:
     while len(headers) < ncols: headers.append("")
     rows = [r + [""] * (ncols - len(r)) for r in rows]
 
-    # ── Step 1: natural column widths (content only, no padding) ────────────
     nat = [len(headers[c]) for c in range(ncols)]
     for row in rows:
         for c in range(ncols):
             nat[c] = max(nat[c], len(row[c]))
 
-    # ── Step 2: fit to terminal ──────────────────────────────────────────────
-    # total width = sum(nat) + 1 padding each side per col + (ncols+1) borders
     try:
         term_w = os.get_terminal_size().columns
     except OSError:
         term_w = 80
-    border_overhead = ncols + 1          # one │ per column + leading │
-    padding_overhead = ncols * 2         # 1 space each side per column
-    available = term_w - border_overhead - padding_overhead
 
-    # shrink: if natural widths exceed available, reduce widest columns first
+    # left-indent the table slightly
+    indent = "  "
+    indent_w = len(indent)
+    border_overhead = ncols + 1
+    padding_overhead = ncols * 2
+    available = term_w - border_overhead - padding_overhead - indent_w
+
     while sum(nat) > available and max(nat) > 1:
         mx = max(nat)
         for i in range(ncols):
@@ -119,43 +143,74 @@ def _render_table(all_lines: list[str]) -> list[str]:
                 nat[i] -= 1
                 break
 
-    # ── Step 3: expand to fill full terminal width ───────────────────────────
     slack = available - sum(nat)
     if slack > 0:
         nat = _ratio_distribute(slack, nat)
 
     widths = nat
 
-    def hline(l, m, r, f="─"):
-        return f"{_TB}{l}{m.join(f * (w + 2) for w in widths)}{r}{_RST}"
+    # ── border helpers ───────────────────────────────────────────────────────
+    _SEP_FG  = "\033[38;2;80;60;45m"    # very dim separator — barely visible
+    _SEP_FG2 = "\033[38;2;110;80;55m"   # slightly brighter for header underline
 
-    def fmt_row(cells, header=False, bg=""):
+    def hline(l, m, r, fg=_SEP_FG, f="─"):
+        return f"{indent}{fg}{l}{m.join(f * (w + 2) for w in widths)}{r}{_RST}"
+
+    def col_sep(fg):
+        return f"{fg}│{_RST}"
+
+    def fmt_header(cells):
         parts = []
         for c, w in enumerate(widths):
-            raw    = cells[c] if c < len(cells) else ""
-            pad    = w - len(raw)
+            raw   = cells[c] if c < len(cells) else ""
+            vis   = len(raw)
+            pad   = w - vis
             styled = _inline(raw)
-            if header:
-                parts.append(f" {_THB}{_TH}{_BOLD}{styled}{_RST}{_THB}{' ' * pad} {_RST}")
-            else:
-                parts.append(f"{bg} {styled}{' ' * pad} {_RST}")
-        return f"{_TB}│{_RST}" + f"{_TB}│{_RST}".join(parts) + f"{_TB}│{_RST}"
+            # warm near-white bold text on dark warm bg, coral left accent on first col
+            accent = f"\033[38;2;218;119;86m▎{_RST}{_THB}" if c == 0 else f"{_THB} "
+            parts.append(f"{_THB}{accent}{_BOLD}{_TH}{styled}{_RST}{_THB}{' ' * pad} {_RST}")
+        return indent + col_sep(_SEP_FG) + col_sep(_SEP_FG).join(parts) + col_sep(_SEP_FG)
 
-    out = [hline("╭", "┬", "╮")]
-    out.append(fmt_row(headers, header=True))
-    out.append(hline("├", "┼", "┤"))
+    def fmt_row(cells, rowidx=0):
+        # alternate: very subtle warm tint vs transparent
+        bg = _BG_ALT if rowidx % 2 == 0 else ""
+        # row text: cream for odd, slightly dimmer sand for even
+        fg = _CREAM if rowidx % 2 != 0 else _SAND
+        parts = []
+        for c, w in enumerate(widths):
+            raw   = cells[c] if c < len(cells) else ""
+            vis   = len(raw)
+            pad   = w - vis
+            styled = _inline(raw)
+            # first column slightly brighter / coral-tinted
+            cell_fg = _CORAL if c == 0 else fg
+            parts.append(f"{bg} {cell_fg}{styled}{_RST}{bg}{' ' * pad} {_RST}")
+        return indent + col_sep(_SEP_FG) + col_sep(_SEP_FG).join(parts) + col_sep(_SEP_FG)
+
+    out = []
+    out.append("")
+    out.append(hline("╭", "┬", "╮", fg=_SEP_FG))
+    out.append(fmt_header(headers))
+    # bold coral underline for header/body separator
+    out.append(hline("├", "┼", "┤", fg=_SEP_FG2, f="─"))
     for i, row in enumerate(rows):
-        out.append(fmt_row(row, bg=_TA if i % 2 == 0 else ""))
-    out.append(hline("╰", "┴", "╯"))
+        out.append(fmt_row(row, rowidx=i))
+    out.append(hline("╰", "┴", "╯", fg=_SEP_FG))
+    out.append("")
     return out
 
 
 def _print_markdown(text: str):
-    lines  = text.split("\n")
-    out    = []
-    i      = 0
+    lines   = text.split("\n")
+    out     = []
+    i       = 0
     in_code = False
     code_lang = ""
+
+    # accent glyphs
+    _H1_ACC = "\033[38;2;218;119;86m"   # coral
+    _H2_ACC = "\033[38;2;94;197;162m"   # sage
+    _H3_ACC = "\033[38;2;196;162;255m"  # orchid
 
     while i < len(lines):
         line = lines[i]
@@ -165,47 +220,68 @@ def _print_markdown(text: str):
             if not in_code:
                 in_code   = True
                 code_lang = line[3:].strip()
-                label     = f" {code_lang}" if code_lang else ""
-                try: tw = os.get_terminal_size().columns - 4
-                except: tw = 76
-                out.append(f"{_CBKG}{_BORD}  ┌{'─' * tw}┐{_RST}")
-                if code_lang:
-                    out.append(f"{_CBKG}{_DIM}  │ {code_lang:<{tw-2}}│{_RST}")
-                    out.append(f"{_CBKG}{_BORD}  ├{'─' * tw}┤{_RST}")
+                try: tw = os.get_terminal_size().columns - 6
+                except: tw = 74
+                # language pill on top-right of header bar
+                lang_label = code_lang.upper() if code_lang else "CODE"
+                lang_pill  = f"\033[38;2;218;119;86m{lang_label}{_RST}"
+                pad_title  = tw - len(lang_label) - 1
+                out.append(f"")
+                out.append(f"  {_BG_CARD}\033[38;2;80;60;45m╭{'─' * (tw + 2)}╮{_RST}")
+                out.append(f"  {_BG_CARD}\033[38;2;80;60;45m│{_RST}{_BG_CARD} {lang_pill}{_BG_CARD}{' ' * pad_title} \033[38;2;80;60;45m│{_RST}")
+                out.append(f"  {_BG_CARD}\033[38;2;80;60;45m├{'─' * (tw + 2)}┤{_RST}")
             else:
-                try: tw = os.get_terminal_size().columns - 4
-                except: tw = 76
-                out.append(f"{_CBKG}{_BORD}  └{'─' * tw}┘{_RST}")
+                try: tw = os.get_terminal_size().columns - 6
+                except: tw = 74
+                out.append(f"  {_BG_CARD}\033[38;2;80;60;45m╰{'─' * (tw + 2)}╯{_RST}")
+                out.append(f"")
                 in_code = False
             i += 1; continue
 
         if in_code:
-            out.append(f"{_CBKG}{_CODE}  │ {line}{_RST}")
+            try: tw = os.get_terminal_size().columns - 6
+            except: tw = 74
+            pad = tw - len(line)
+            out.append(f"  {_BG_CARD}\033[38;2;80;60;45m│{_RST}{_BG_CARD} {_VIOLET}{line}{_RST}{_BG_CARD}{' ' * max(pad, 0)} \033[38;2;80;60;45m│{_RST}")
             i += 1; continue
 
         # ── headings ─────────────────────────────────────────────────────────
         if line.startswith("#### "):
-            out.append(f"{_H4}{_BOLD}{line[5:]}{_RST}"); i += 1; continue
+            title = line[5:]
+            out.append(f"  \033[38;2;130;115;95m▸ {_BOLD}{_SAND}{title}{_RST}")
+            i += 1; continue
+
         if line.startswith("### "):
-            out.append(f"\n{_H3}{_BOLD}{line[4:]}{_RST}"); i += 1; continue
+            title = line[4:]
+            out.append(f"")
+            out.append(f"  {_H3_ACC}{_BOLD}◆ {title}{_RST}")
+            i += 1; continue
+
         if line.startswith("## "):
-            out.append(f"\n{_H2}{_BOLD}{line[3:]}{_RST}\n"); i += 1; continue
+            title = line[3:]
+            out.append(f"")
+            out.append(f"  {_H2_ACC}{_BOLD}━━ {title}{_RST}")
+            i += 1; continue
+
         if line.startswith("# "):
-            try: tw = os.get_terminal_size().columns
-            except: tw = 80
             title = line[2:]
-            out.append(f"\n{_H1}{_BOLD}{_UL}{title}{_RST}")
-            out.append(f"{_H1}{'─' * min(len(title), tw)}{_RST}\n")
+            try: tw = os.get_terminal_size().columns - 4
+            except: tw = 76
+            bar_len = min(len(title) + 6, tw)
+            out.append(f"")
+            out.append(f"  {_H1_ACC}{_BOLD}  {title}  {_RST}")
+            out.append(f"  {_H1_ACC}{'▔' * bar_len}{_RST}")
+            out.append(f"")
             i += 1; continue
 
         # ── horizontal rule ──────────────────────────────────────────────────
         if _re.match(r'^\s*[-*_]{3,}\s*$', line) and not line.strip().startswith("*") or _re.match(r'^\s*---+\s*$', line):
-            try: tw = os.get_terminal_size().columns
-            except: tw = 80
-            out.append(f"{_BORD}{'─' * tw}{_RST}"); i += 1; continue
+            try: tw = os.get_terminal_size().columns - 4
+            except: tw = 76
+            out.append(f"  \033[38;2;80;60;45m{'╌' * tw}{_RST}")
+            i += 1; continue
 
-        # ── table: collect consecutive pipe-containing lines ─────────────────
-        # allow blank lines between rows (model sometimes adds them)
+        # ── table ─────────────────────────────────────────────────────────────
         if "|" in line:
             tbl = []
             while i < len(lines):
@@ -213,7 +289,7 @@ def _print_markdown(text: str):
                 if "|" in l:
                     tbl.append(l); i += 1
                 elif l.strip() == "" and i + 1 < len(lines) and "|" in lines[i + 1]:
-                    i += 1  # skip blank line between rows
+                    i += 1
                 else:
                     break
             if len(tbl) >= 2 and _is_sep(_parse_row(tbl[min(1, len(tbl)-1)])):
@@ -226,17 +302,38 @@ def _print_markdown(text: str):
         # ── blockquote ───────────────────────────────────────────────────────
         if line.startswith(">"):
             inner = line[1:].lstrip()
-            out.append(f"{_QUOTE_BAR}▌{_RST} {_QUOTE_TXT}{_inline(inner)}{_RST}")
+            out.append(f"  {_QUOTE_BAR}┃{_RST}  {_QUOTE_TXT}{_ITAL}{_inline(inner)}{_RST}")
+            i += 1; continue
+
+        # ── task list ────────────────────────────────────────────────────────
+        m = _re.match(r'^(\s*)[-*+] \[([ xX])\] (.*)', line)
+        if m:
+            depth  = len(m.group(1)) // 2
+            done   = m.group(2).lower() == "x"
+            body   = m.group(3)
+            indent = "  " * depth
+            if done:
+                box = f"\033[38;2;94;197;162m✓{_RST}"
+                txt = f"\033[38;2;100;85;70m{body}{_RST}"
+            else:
+                box = f"\033[38;2;80;60;45m○{_RST}"
+                txt = _inline(body)
+            out.append(f"  {indent}{box}  {txt}")
             i += 1; continue
 
         # ── bullets ──────────────────────────────────────────────────────────
         m = _re.match(r'^(\s*)([-*+]) (.*)', line)
         if m:
             depth  = len(m.group(1)) // 2
-            glyphs = ["•", "◦", "▸", "▹"]
+            glyphs = [
+                f"{_CORAL}◉{_RST}",
+                f"{_SAGE}◈{_RST}",
+                f"{_ORCHID}◇{_RST}",
+                f"{_SAND}·{_RST}",
+            ]
             glyph  = glyphs[min(depth, len(glyphs)-1)]
-            indent = "  " * depth
-            out.append(f"{indent}{_BULL}{glyph}{_RST} {_inline(m.group(3))}")
+            indent = "   " * depth
+            out.append(f"  {indent}{glyph}  {_inline(m.group(3))}")
             i += 1; continue
 
         # ── numbered list ────────────────────────────────────────────────────
@@ -244,7 +341,7 @@ def _print_markdown(text: str):
         if m:
             indent = m.group(1)
             num    = m.group(2)
-            out.append(f"{indent}{_NUM}{num}.{_RST} {_inline(m.group(3))}")
+            out.append(f"  {indent}{_TERRA}{_BOLD}{num}.{_RST}  {_inline(m.group(3))}")
             i += 1; continue
 
         # ── normal line ──────────────────────────────────────────────────────
