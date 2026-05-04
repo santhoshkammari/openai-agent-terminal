@@ -9,6 +9,7 @@ Use bash, read, edit, glob, grep tools.
 import os, sys, json, subprocess, threading, time, itertools
 from pathlib import Path
 from typing import Literal, Union
+from pprint import pprint
 
 import readline, tty, termios, fcntl
 import re as _re
@@ -1197,6 +1198,9 @@ class AIAgent:
             resolve_args, self._resolve_structured_output(structured_output)
         )
         _tools = self._resolve_tools(tools)
+
+        print(resolve_args)
+
         stream = self.client.chat.completions.create(
             messages=_messages, model=model, max_tokens=max_tokens,
             stream=True,
@@ -4471,15 +4475,6 @@ class AICli:
                 f.write("".join(answer_parts))
             print(f"\033[90m[saved → {args.output}]\033[0m", file=sys.stderr)
 
-        # ── save session & show session footer ─────────────────────────────
-        if db_fns:
-            history = [m for m in chat.messages if m["role"] != "system"]
-            if history:
-                save_session_fn(session_id, title_fn(chat.messages), chat.messages, work_dir=work_dir)
-        #print(
-            #f"\033[2msession: {session_id}  |  --resume {session_id}  |  --continue\033[0m",
-            #file=sys.stderr,
-        #)
 
     @classmethod
     def _run_opencode(cls, agent: OpenCodeAgent, prompt: str, args):
@@ -4597,75 +4592,77 @@ class AICli:
 
 
 if __name__ == "__main__":
-    # AICli.run()
-    import argparse
-
-    parser = argparse.ArgumentParser(description="ai_cli — AI REPL or single prompt")
-    parser.add_argument("-d", "--dir", default=".", help="working directory")
-    parser.add_argument("--url", default=None, help="override OPENAI_BASE_URL")
-    parser.add_argument(
-        "--prompt",
-        "-p",
-        metavar="TEXT",
-        nargs="?",
-        const=True,
-        help="single prompt mode (or just -p with text args)",
-    )
-    parser.add_argument("text", nargs="*", help="prompt text (when --prompt is used)")
-    parser.add_argument("--resume", metavar="ID", help="resume a saved session by ID")
-    parser.add_argument(
-        "--continue", action="store_true", help="continue latest session for cwd"
-    )
-    parser.add_argument("--list", action="store_true", help="list all saved sessions")
-    args = parser.parse_args()
-
-    if args.url:
-        os.environ["OPENAI_BASE_URL"] = args.url
-
-    if args.list:
-        rows = list_sessions()
-        if not rows:
-            print("no saved sessions")
-        else:
-            for r in rows:
-                print(f"{r['id']}  {r['updated']}  {r['work_dir']}  {r['title']}")
-        sys.exit(0)
-
-    work_dir = str(Path(args.dir).resolve())
-
-    if args.resume:
-        rec = load_session(args.resume)
-        if not rec:
-            print(f"{RED}session {args.resume!r} not found{RESET}")
-            sys.exit(1)
-        run_repl(
-            rec["work_dir"] or work_dir,
-            session_id=rec["id"],
-            initial_history=rec["history"],
-        )
-        sys.exit(0)
-
-    if getattr(args, "continue"):
-        rec = latest_session_for_dir(work_dir)
-        if not rec:
-            print(f"{DIM}no session for {work_dir}, starting fresh{RESET}")
-            run_repl(work_dir)
-        else:
-            run_repl(
-                rec["work_dir"], session_id=rec["id"], initial_history=rec["history"]
-            )
-        sys.exit(0)
-
-    if args.prompt or args.text:
-        if args.text:
-            prompt_text = " ".join(args.text)
-        elif isinstance(args.prompt, str):
-            prompt_text = args.prompt
-        else:
-            prompt_text = ""
-        if not prompt_text:
-            print(f"{RED}no prompt provided{RESET}")
-            sys.exit(1)
-        _run_single_prompt(prompt_text, work_dir)
+    if len(sys.argv) != 1:
+        AICli.run()
     else:
-        run_repl(work_dir)
+        import argparse
+
+        parser = argparse.ArgumentParser(description="ai_cli — AI REPL or single prompt")
+        parser.add_argument("-d", "--dir", default=".", help="working directory")
+        parser.add_argument("--url", default=None, help="override OPENAI_BASE_URL")
+        parser.add_argument(
+            "--prompt",
+            "-p",
+            metavar="TEXT",
+            nargs="?",
+            const=True,
+            help="single prompt mode (or just -p with text args)",
+        )
+        parser.add_argument("text", nargs="*", help="prompt text (when --prompt is used)")
+        parser.add_argument("--resume", metavar="ID", help="resume a saved session by ID")
+        parser.add_argument(
+            "--continue", action="store_true", help="continue latest session for cwd"
+        )
+        parser.add_argument("--list", action="store_true", help="list all saved sessions")
+        args = parser.parse_args()
+
+        if args.url:
+            os.environ["OPENAI_BASE_URL"] = args.url
+
+        if args.list:
+            rows = list_sessions()
+            if not rows:
+                print("no saved sessions")
+            else:
+                for r in rows:
+                    print(f"{r['id']}  {r['updated']}  {r['work_dir']}  {r['title']}")
+            sys.exit(0)
+
+        work_dir = str(Path(args.dir).resolve())
+
+        if args.resume:
+            rec = load_session(args.resume)
+            if not rec:
+                print(f"session {args.resume!r} not found")
+                sys.exit(1)
+            run_repl(
+                rec["work_dir"] or work_dir,
+                session_id=rec["id"],
+                initial_history=rec["history"],
+            )
+            sys.exit(0)
+
+        if getattr(args, "continue"):
+            rec = latest_session_for_dir(work_dir)
+            if not rec:
+                print(f"no session for {work_dir}, starting fresh")
+                run_repl(work_dir)
+            else:
+                run_repl(
+                    rec["work_dir"], session_id=rec["id"], initial_history=rec["history"]
+                )
+            sys.exit(0)
+
+        if args.prompt or args.text:
+            if args.text:
+                prompt_text = " ".join(args.text)
+            elif isinstance(args.prompt, str):
+                prompt_text = args.prompt
+            else:
+                prompt_text = ""
+            if not prompt_text:
+                print("no prompt provided")
+                sys.exit(1)
+            _run_single_prompt(prompt_text, work_dir)
+        else:
+            run_repl(work_dir)
